@@ -11,9 +11,11 @@ if a == '4' and int(b) >= 37:
 def build_image_tower(image_tower_cfg, **kwargs):
     image_tower = getattr(image_tower_cfg, 'mm_image_tower', getattr(image_tower_cfg, 'image_tower', None))
     # is_absolute_path_exists = os.path.exists(image_tower)
-    if image_tower.startswith("openai") or image_tower.startswith("laion"):
+    # if image_tower.startswith("openai") or image_tower.startswith("laion"):
+    if "clip" in image_tower.lower(): 
         return CLIPVisionTower(image_tower, args=image_tower_cfg, cache_dir='./cache_dir', **kwargs)
-    if image_tower.startswith("google"):
+    # if image_tower.startswith("google"):
+    if "siglip" in image_tower.lower():
         return SiglipVisionTower(image_tower, args=image_tower_cfg, cache_dir='./cache_dir', **kwargs)
     if image_tower.endswith('LanguageBind_Image'):
         return LanguageBindImageTower(image_tower, args=image_tower_cfg, cache_dir='./cache_dir', **kwargs)
