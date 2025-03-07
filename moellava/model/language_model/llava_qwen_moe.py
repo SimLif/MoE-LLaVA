@@ -515,7 +515,7 @@ class MoELLaVAQWenForCausalLM(QWenLMHeadModel, LlavaQWenMetaForCausalLM):
                     moe_losses.append(moe_loss)
             moe_loss = self.router_aux_loss_coef * sum(moe_losses)
             if labels is not None:
-                print(loss, moe_loss, loss + moe_loss)
+                # print(loss, moe_loss, loss + moe_loss)
                 loss += moe_loss
 
         if not return_dict:
