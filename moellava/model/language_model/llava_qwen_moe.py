@@ -560,11 +560,56 @@ class MoELLaVAQWenForCausalLM(QWenLMHeadModel, LlavaQWenMetaForCausalLM):
         #         # 'wte', 'lm_head'
         #     ]
         if self.config.moe['train_modules'] is not None and len(self.config.moe['train_modules']) > 0:
+            # First, freeze all parameters
             for n, p in self.named_parameters():
-                if any(name in n for name in self.config.moe['train_modules']):
-                    continue
-                else:
-                    p.requires_grad = False
+                p.requires_grad = False
+            
+            # Then, selectively unfreeze parameters based on train_modules
+            for n, p in self.named_parameters():
+                for module in self.config.moe['train_modules']:
+                    # Handle MoE expert parameters
+                    if 'deepspeed_moe.experts.deepspeed_experts' in n:
+                        if module in ['mlp.w1', 'mlp.w2', 'mlp.c_proj'] and module.split('.')[-1] in n:
+                            p.requires_grad = True
+                            break
+                    # Handle MoE gate parameters
+                    elif 'deepspeed_moe.gate' in n and module == 'wg' and 'wg' in n:
+                        p.requires_grad = True
+                        break
+                    # Handle regular parameters
+                    elif module in n:
+                        p.requires_grad = True
+                        break
+            
+            # Validate and print trainable parameters
+            moe_trainable_params = []
+            non_moe_trainable_params = []
+
+            for n, p in self.named_parameters():
+                if p.requires_grad:
+                    if 'deepspeed_moe' in n:
+                        moe_trainable_params.append(n)
+                    else:
+                        non_moe_trainable_params.append(n)
+
+            print(f"Total trainable parameters: {len(moe_trainable_params) + len(non_moe_trainable_params)}")
+            print(f"MoE parameters: {len(moe_trainable_params)}")
+            print(f"Non-MoE parameters: {len(non_moe_trainable_params)}")
+
+            print("\nTrainable MoE parameters:")
+            for i, param_name in enumerate(moe_trainable_params):
+                print(f"{i+1}. {param_name}")
+
+            print("\nTrainable non-MoE parameters:")
+            for i, param_name in enumerate(non_moe_trainable_params):
+                print(f"{i+1}. {param_name}")
+
+            if len(moe_trainable_params) == 0:
+                print("\nWARNING: No trainable MoE parameters found. DeepSpeed will likely raise an error.")
+
+        if model_args.skip_moe_init:
+            print("Skip MoE initialization")
+            return
 
         num_layers = self.config.num_hidden_layers
 
