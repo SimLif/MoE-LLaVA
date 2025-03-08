@@ -12,12 +12,13 @@ export WANDB_PROJECT=moe-llava-med
 export NCCL_P2P_DISABLE=1
 export HF_DATASETS_OFFLINE=1 
 export TRANSFORMERS_OFFLINE=1 
-deepspeed --include=localhost:2,3 moellava/train/train_mem.py \
+deepspeed --include=localhost:0,1 moellava/train/train_mem.py \
     --moe_enable True --num_experts ${num_experts} --top_k_experts ${top_k_experts} --capacity_factor 1.5 \
     --moe_mode ${moe_mode} --use_residual ${use_residual} --router_aux_loss_coef ${router_aux_loss_coef} \
     --train_modules mlp.w1 mlp.w2 mlp.c_proj wg \
     --deepspeed ./scripts/zero2.json \
     --model_name_or_path /mnt/data/haoqiang/workspace/models/moe-llava-qwen-1.8b-4e \
+    --skip_moe_init True \
     --version qwen \
     --data_path ${JSON_FOLDER}/train_all_converted.json \
     --image_folder ${IMAGE_FOLDER} \
@@ -29,7 +30,7 @@ deepspeed --include=localhost:2,3 moellava/train/train_mem.py \
     --image_aspect_ratio pad \
     --group_by_modality_length True \
     --bf16 True \
-    --output_dir ./checkpoints/moe-llava-qwen-1.8b-4e\
+    --output_dir ./checkpoints/moe-llava-qwen-1.8b-4e-1epoch\
     --num_train_epochs 1 \
     --per_device_train_batch_size 8 \
     --per_device_eval_batch_size 4 \
