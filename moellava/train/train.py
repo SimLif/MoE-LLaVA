@@ -37,6 +37,7 @@ from moellava.train.llava_trainer import LLaVATrainer
 from moellava import conversation as conversation_lib
 from moellava.model import *
 from moellava.mm_utils import tokenizer_image_token
+from moellava.model.language_model.llava_qwen_moe import EvalMoELLaVAQWenForCausalLM
 
 from PIL import Image
 from moellava.utils import order_pick_k
@@ -97,6 +98,8 @@ class ModelArguments:
     use_residual: bool = False
     router_aux_loss_coef: float = 0.01
     # =============================================================
+
+    skip_moe_init: bool = False
 
 @dataclass
 class DataArguments:
@@ -1235,11 +1238,18 @@ def train():
                 )
         else:
             if 'qwen' in model_args.model_name_or_path.lower() and '1.5' not in model_args.model_name_or_path.lower():
-                model = MoELLaVAQWenForCausalLM.from_pretrained(
-                    model_args.model_name_or_path,
-                    cache_dir=training_args.cache_dir,
-                    **bnb_model_from_pretrained_args
-                )
+                if model_args.skip_moe_init:
+                    model = EvalMoELLaVAQWenForCausalLM.from_pretrained(
+                        model_args.model_name_or_path,
+                        cache_dir=training_args.cache_dir,
+                        **bnb_model_from_pretrained_args
+                    )
+                else:
+                    model = MoELLaVAQWenForCausalLM.from_pretrained(
+                        model_args.model_name_or_path,
+                        cache_dir=training_args.cache_dir,
+                        **bnb_model_from_pretrained_args
+                    )
             elif 'qwen' in model_args.model_name_or_path.lower() and '1.5' in model_args.model_name_or_path.lower():
                 model = MoELLaVAQwen1_5ForCausalLM.from_pretrained(
                     model_args.model_name_or_path,
