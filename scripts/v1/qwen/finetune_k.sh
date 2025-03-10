@@ -1,27 +1,30 @@
 #!/bin/bash
 
-JSON_FOLDER="ft_json"
+JSON_FOLDER="/mnt/data/haoqiang/workspace/data/med-k-nlp"
 IMAGE_FOLDER="train_image_video"
-cd ~/MoE-LLaVA
-HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 deepspeed moellava/train/train_mem.py \
+cd ~/workspace/05-moe-llava
+export WANDB_PROJECT=med-k-expert
+export NCCL_P2P_DISABLE=1
+export HF_DATASETS_OFFLINE=1 
+export TRANSFORMERS_OFFLINE=1 
+deepspeed --include=localhost:0,1 moellava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
-    --model_name_or_path Qwen/Qwen-1_8B \
+    --model_name_or_path /mnt/data/haoqiang/workspace/models/moe-llava-qwen-stage2 \
+    --ffn_only True \
     --version qwen \
-    --data_path ${JSON_FOLDER}/la_tune_256k.json \
-                ${JSON_FOLDER}/lrv_tune_331k.json ${JSON_FOLDER}/lvis_tune_220k_.json \
-                ${JSON_FOLDER}/svit_tune_157k.json ${JSON_FOLDER}/nlp_tune.json \
+    --data_path ${JSON_FOLDER}/en-medical-o1-reasoning-sft-25k.json \
+                ${JSON_FOLDER}/zh-disc-med-sft-cmekg-50k.json \
     --image_folder ${IMAGE_FOLDER} \
-    --image_tower openai/clip-vit-large-patch14-336 \
+    --image_tower /mnt/data/haoqiang/workspace/models/clip-vit-large-patch14-336 \
     --image_projector_type mlp2x_gelu \
-    --pretrain_mm_mlp_adapter ./checkpoints/llavaqwen-1.8b-pretrain/mm_projector.bin \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
     --image_aspect_ratio pad \
     --group_by_modality_length True \
     --bf16 True \
-    --output_dir ./checkpoints/llavaqwen-1.8b-finetune \
-    --num_train_epochs 1 \
+    --output_dir ./checkpoints/moe-llava-qwen-stage2-k-10epoch \
+    --num_train_epochs 10 \
     --per_device_train_batch_size 8 \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps 2 \
@@ -39,6 +42,7 @@ HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 deepspeed moellava/train/train_mem.
     --gradient_checkpointing True \
     --dataloader_num_workers 4 \
     --lazy_preprocess True \
-    --report_to tensorboard \
+    --report_to wandb \
+    --run_name "test-k-expert" \
     --cache_dir "./cache_dir"
 

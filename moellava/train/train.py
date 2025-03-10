@@ -100,6 +100,7 @@ class ModelArguments:
     # =============================================================
 
     skip_moe_init: bool = False
+    ffn_only: bool = False
 
 @dataclass
 class DataArguments:
@@ -1387,6 +1388,26 @@ def train():
             rank0_print("Adding LoRA adapters...")
             model = get_peft_model(model, lora_config)
     # ==============================================================================================
+
+    if model_args.ffn_only:
+        for n, p in model.named_parameters():
+            if any(name in n for name in ["mlp.w1", "mlp.w2", "mlp.c_proj"]):
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
+            trainable_params = []
+
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                trainable_params.append(name)
+        
+        rank0_print(f"Number of trainable parameters: {len(trainable_params)}")
+        rank0_print("List of trainable parameters:")
+        for param_name in trainable_params:
+            rank0_print(f"  {param_name}")
+        
+        total_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        rank0_print(f"Total number of trainable parameters: {total_trainable_params / 1e6:.2f}M")
 
     if 'mpt' in model_args.model_name_or_path:
         tokenizer = transformers.AutoTokenizer.from_pretrained(
