@@ -38,6 +38,7 @@ from moellava import conversation as conversation_lib
 from moellava.model import *
 from moellava.mm_utils import tokenizer_image_token
 from moellava.model.language_model.llava_qwen_moe import EvalMoELLaVAQWenForCausalLM
+from moellava.train.utils import replace_specific_moe_layer
 
 from PIL import Image
 from moellava.utils import order_pick_k
@@ -101,6 +102,8 @@ class ModelArguments:
 
     skip_moe_init: bool = False
     ffn_only: bool = False
+    load_k_experts: bool = False
+    k_experts_path: Optional[str] = None
 
 @dataclass
 class DataArguments:
@@ -1408,6 +1411,15 @@ def train():
         
         total_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         rank0_print(f"Total number of trainable parameters: {total_trainable_params / 1e6:.2f}M")
+
+    if model_args.load_k_experts:
+        model_k = LlavaQWenForCausalLM.from_pretrained(
+            model_args.k_experts_path,
+            cache_dir=training_args.cache_dir,
+            **bnb_model_from_pretrained_args
+        )
+        model = replace_specific_moe_layer(model, model_k, model.config.moe['moe_layers_idx'])
+        del model_k
 
     if 'mpt' in model_args.model_name_or_path:
         tokenizer = transformers.AutoTokenizer.from_pretrained(

@@ -19,6 +19,8 @@ deepspeed --include=localhost:0,1 moellava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
     --model_name_or_path /mnt/data/haoqiang/workspace/models/moe-llava-qwen-stage2 \
     --skip_moe_init False \
+    --load_k_experts True \
+    --k_experts_path /mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/moe-llava-qwen-stage2-k-10epoch \
     --version qwen \
     --data_path ${JSON_FOLDER}/train_all_converted.json \
     --image_folder ${IMAGE_FOLDER} \
@@ -30,7 +32,7 @@ deepspeed --include=localhost:0,1 moellava/train/train_mem.py \
     --image_aspect_ratio pad \
     --group_by_modality_length True \
     --bf16 True \
-    --output_dir ./checkpoints/moe-llava-qwen-1.8b-4e-s2-9epoch\
+    --output_dir ./checkpoints/moe-llava-qwen-1.8b-4e-s2-k-9epoch\
     --num_train_epochs 9 \
     --per_device_train_batch_size 8 \
     --per_device_eval_batch_size 4 \
