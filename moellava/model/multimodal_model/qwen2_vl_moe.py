@@ -4,10 +4,11 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from transformers import AutoConfig, AutoModelForConditionalGeneration, DynamicCache, Cache
+from transformers import DynamicCache, Cache
+from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask, \
     _prepare_4d_causal_attention_mask_for_sdpa
-from moellava.model.multimodal_model.qwen2_vl import Qwen2VLConfig, Qwen2VLModel, Qwen2VLForConditionalGeneration
+from transformers import Qwen2VLConfig, Qwen2VLModel, Qwen2VLForConditionalGeneration
 
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -15,7 +16,7 @@ from deepspeed.moe.layer import MoE
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union, List
 from torch.nn import CrossEntropyLoss
-from transformers.models.llama.modeling_llama import logger
+from transformers.models.qwen2_vl.modeling_qwen2_vl import logger
 from transformers.utils import ModelOutput
 
 local_rank = None
@@ -24,6 +25,39 @@ local_rank = None
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
+
+
+# 定义小专家类
+class SmallExpert(nn.Module):
+    def __init__(self, hidden_size, r, dropout_rate=0.0):
+        super().__init__()
+        self.down_proj = nn.Linear(hidden_size, r, bias=False)
+        self.act_fn = nn.SiLU()  # 与 Qwen2 MLP 保持一致
+        self.dropout = nn.Dropout(dropout_rate)  # 可选的 dropout
+        self.up_proj = nn.Linear(r, hidden_size, bias=False)
+        
+    def forward(self, x):
+        x = self.down_proj(x)
+        x = self.act_fn(x)
+        x = self.dropout(x)
+        x = self.up_proj(x)
+        return x
+
+# 定义组合层，结合原始MLP和MoE
+class CombinedLayer(nn.Module):
+    def __init__(self, original_mlp, moe_layer):
+        super().__init__()
+        self.original_mlp = original_mlp
+        self.moe_layer = moe_layer
+        
+    def forward(self, x):
+        mlp_out = self.original_mlp(x)
+        moe_out = self.moe_layer(x)
+        # 处理MoE返回的(output, loss)元组
+        if isinstance(moe_out, tuple) and len(moe_out) >= 2:
+            return mlp_out + moe_out[0], moe_out[1]
+        else:
+            return mlp_out + moe_out, None
 
 
 class MoEQwen2VLConfig(Qwen2VLConfig):
@@ -87,7 +121,9 @@ def MoEQwen2DecoderLayer_forward(self):
             past_key_value: Optional[Tuple[torch.Tensor]] = None,
             output_attentions: Optional[bool] = False,
             use_cache: Optional[bool] = False,
-            **kwargs
+            cache_position: Optional[torch.LongTensor] = None,
+            position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+            **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -101,6 +137,10 @@ def MoEQwen2DecoderLayer_forward(self):
                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
                 (see `past_key_values`).
             past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
+            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+                Indices depicting the position of the input sequence tokens in the sequence.
+            position_embeddings (`Tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*):
+                Tuple containing the cosine and sine positional embeddings for rotary attention.
         """
 
         residual = hidden_states
@@ -115,6 +155,8 @@ def MoEQwen2DecoderLayer_forward(self):
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
         )
         hidden_states = residual + hidden_states
 
@@ -160,6 +202,7 @@ def MoEQwen2VLModel_forward(self):
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
+            cache_position: Optional[torch.LongTensor] = None,
             output_moe_loss: Optional[bool] = True,
     ) -> Union[Tuple, MoEBaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -169,15 +212,8 @@ def MoEQwen2VLModel_forward(self):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # retrieve input_ids and inputs_embeds
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
-        elif input_ids is not None:
-            batch_size, seq_length = input_ids.shape
-        elif inputs_embeds is not None:
-            batch_size, seq_length, _ = inputs_embeds.shape
-        else:
-            raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if self.gradient_checkpointing and self.training:
             if use_cache:
@@ -186,60 +222,35 @@ def MoEQwen2VLModel_forward(self):
                 )
                 use_cache = False
 
-        past_key_values_length = 0
-
-        if use_cache:
-            use_legacy_cache = not isinstance(past_key_values, Cache)
-            if use_legacy_cache:
-                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-            past_key_values_length = past_key_values.get_usable_length(seq_length)
-
-        if position_ids is None:
-            device = input_ids.device if input_ids is not None else inputs_embeds.device
-            position_ids = torch.arange(
-                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
-            )
-            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
-        else:
-            position_ids = position_ids.view(-1, seq_length).long()
+        # torch.jit.trace() doesn't support cache objects in the output
+        if use_cache and past_key_values is None and not torch.jit.is_tracing():
+            past_key_values = DynamicCache()
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if attention_mask is not None and self._attn_implementation == "flash_attention_2" and use_cache:
-            is_padding_right = attention_mask[:, -1].sum().item() != batch_size
-            if is_padding_right:
-                raise ValueError(
-                    "You are attempting to perform batched generation with padding_side='right'"
-                    " this may lead to unexpected behaviour for Flash Attention version of Qwen2. Make sure to "
-                    " call `tokenizer.padding_side  = 'left'` before tokenizing the input. "
-                )
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
 
-        if self._attn_implementation == "flash_attention_2":
-            # 2d mask is passed through the layers
-            attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
-        elif self._attn_implementation == "sdpa" and not output_attentions:
-            # output_attentions=True can not be supported when using SDPA, and we fall back on
-            # the manual implementation that requires a 4D causal mask in all cases.
-            attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
-                attention_mask,
-                (batch_size, seq_length),
-                inputs_embeds,
-                past_key_values_length,
-            )
-        else:
-            # 4d mask is passed through the layers
-            attention_mask = _prepare_4d_causal_attention_mask(
-                attention_mask,
-                (batch_size, seq_length),
-                inputs_embeds,
-                past_key_values_length,
-                sliding_window=self.config.sliding_window,
-            )
+        # the hard coded `3` is for temporal, height and width.
+        if position_ids is None:
+            position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
+        elif position_ids.dim() == 2:
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+
+        causal_mask = self._update_causal_mask(
+            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+        )
 
         hidden_states = inputs_embeds
-        # decoder layers
 
+        # create position embeddings to be shared across the decoder layers
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
@@ -253,20 +264,24 @@ def MoEQwen2VLModel_forward(self):
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
-                    attention_mask,
+                    causal_mask,
                     position_ids,
                     past_key_values,
                     output_attentions,
                     use_cache,
+                    cache_position,
+                    position_embeddings,
                 )
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
-                    attention_mask=attention_mask,
+                    attention_mask=causal_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_values,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
                 )
 
             hidden_states = layer_outputs[0]
@@ -286,9 +301,7 @@ def MoEQwen2VLModel_forward(self):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        next_cache = None
-        if use_cache:
-            next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache else next_decoder_cache
+        next_cache = next_decoder_cache if use_cache else None
 
         if not return_dict:
             return tuple(
@@ -307,13 +320,21 @@ def MoEQwen2VLModel_forward(self):
 
 class MoEQwen2VLModel(Qwen2VLModel):
     config_class = MoEQwen2VLConfig
+    
+    def __init__(self, config):
+        super().__init__(config)
+        self._attn_implementation = config._attn_implementation
+        
+    # We need to inherit the _update_causal_mask method to ensure proper functionality
+    # This is referenced in the forward method
+    _update_causal_mask = Qwen2VLModel._update_causal_mask
 
 
 class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
     config_class = MoEQwen2VLConfig
 
     def __init__(self, config):
-        super(Qwen2VLForConditionalGeneration, self).__init__(config)
+        super().__init__(config)
         self.model = MoEQwen2VLModel(config)
         
         # Initialize or reuse components
@@ -322,12 +343,14 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
         
         # Initialize weights and apply final processing
         self.post_init()
-        self.router_aux_loss_coef = 0.01  # Default value
 
     def forward(
             self,
             input_ids: Optional[torch.LongTensor] = None,
             pixel_values: Optional[torch.FloatTensor] = None,
+            pixel_values_videos: Optional[torch.FloatTensor] = None,
+            image_grid_thw: Optional[torch.LongTensor] = None,
+            video_grid_thw: Optional[torch.LongTensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
             past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -337,7 +360,8 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
-            images: Optional[torch.FloatTensor] = None,
+            rope_deltas: Optional[torch.LongTensor] = None,
+            cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, MoECausalLMOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -345,72 +369,88 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if labels is not None:
-            if use_cache:
-                logger.warning("The `use_cache` argument is changed to `False` since `labels` is provided.")
-            use_cache = False
 
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
-        elif input_ids is not None:
-            batch_size, sequence_length = input_ids.shape[:2]
-        elif inputs_embeds is not None:
-            batch_size, sequence_length = inputs_embeds.shape[:2]
-        else:
-            raise ValueError("You have to specify either input_ids or inputs_embeds")
 
-        if pixel_values is not None and images is not None:
-            raise ValueError("You cannot specify both pixel_values and images at the same time")
 
-        if images is not None:
-            pixel_values = images
-
-        if pixel_values is not None:
-            if not hasattr(self, "visual"):
-                vision_outputs = None
-            else:
-                vision_outputs = self.visual(pixel_values)
-        else:
-            vision_outputs = None
-
-        if vision_outputs is not None:
-            if isinstance(vision_outputs, dict):
-                vision_hidden_states = vision_outputs.get("image_features", None) or vision_outputs.get(
-                    "last_hidden_state", None
+        if inputs_embeds is None:
+            inputs_embeds = self.model.embed_tokens(input_ids)
+            if pixel_values is not None:
+                pixel_values = pixel_values.type(self.visual.get_dtype())
+                image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+                n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
+                n_image_features = image_embeds.shape[0]
+                if n_image_tokens != n_image_features:
+                    print(f"input_ids: {input_ids}")
+                    print(f"image_grid_thw: {image_grid_thw}")
+                    print(f"image_embeds: {image_embeds}") 
+                    raise ValueError(
+                        f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+                    )
+                image_mask = (
+                    (input_ids == self.config.image_token_id)
+                    .unsqueeze(-1)
+                    .expand_as(inputs_embeds)
+                    .to(inputs_embeds.device)
                 )
+                image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+            if pixel_values_videos is not None:
+                pixel_values_videos = pixel_values_videos.type(self.visual.get_dtype())
+                video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
+                n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
+                n_video_features = video_embeds.shape[0]
+                if n_video_tokens != n_video_features:
+                    raise ValueError(
+                        f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
+                    )
+                video_mask = (
+                    (input_ids == self.config.video_token_id)
+                    .unsqueeze(-1)
+                    .expand_as(inputs_embeds)
+                    .to(inputs_embeds.device)
+                )
+                video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(inputs_embeds.device)
+
+        # Calculate position IDs and rope deltas if needed
+        if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):
+            # Calculate RoPE index once per generation in the pre-fill stage only
+            if (
+                (cache_position is not None and cache_position[0] == 0)
+                or self.rope_deltas is None
+                or (past_key_values is None or past_key_values.get_seq_length() == 0)
+            ):
+                position_ids, rope_deltas = self.get_rope_index(
+                    input_ids, image_grid_thw, video_grid_thw, attention_mask
+                )
+                self.rope_deltas = rope_deltas
+            # Use the previously calculated rope-deltas to get the correct position ids
             else:
-                vision_hidden_states = vision_outputs
-
-            if inputs_embeds is None:
-                inputs_embeds = self.get_input_embeddings()(input_ids)
-
-            mode = getattr(self.config, "multimodal_projector_type", "")
-            if "pretrain" in mode.lower():
-                if hasattr(self, "projector_embedding") and self.projector_embedding is not None:
-                    vision_hidden_states = self.projector_embedding(vision_hidden_states)
-
-            image_sizes = None
-            if hasattr(vision_outputs, "image_sizes"):
-                image_sizes = vision_outputs.image_sizes
-
-            inputs_embeds, attention_mask, position_ids = self.multimodal_projector(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                image_features=vision_hidden_states,
-                image_sizes=image_sizes,
-            )
+                batch_size, seq_length, _ = inputs_embeds.shape
+                delta = cache_position[0] + self.rope_deltas if cache_position is not None else 0
+                position_ids = torch.arange(seq_length, device=inputs_embeds.device)
+                position_ids = position_ids.view(1, -1).expand(batch_size, -1)
+                if cache_position is not None:  # otherwise `deltas` is an int `0`
+                    delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
+                    delta = delta.to(position_ids.device)
+                position_ids = position_ids.add(delta)
+                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
         outputs = self.model(
-            input_ids=None if inputs_embeds is not None else input_ids,
-            attention_mask=attention_mask,
+            input_ids=None,
             position_ids=position_ids,
+            attention_mask=attention_mask,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            cache_position=cache_position,
         )
 
         hidden_states = outputs[0]
@@ -439,7 +479,7 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
             if moe_losses:
                 moe_loss = self.router_aux_loss_coef * sum(moe_losses)
                 if labels is not None:
-                    print(f"Loss: {loss}, MoE Loss: {sum(moe_losses)}, Total: {loss + moe_loss}")
+                    # print(f"Loss: {loss}, MoE Loss: {sum(moe_losses)}, Total: {loss + moe_loss}")
                     loss += moe_loss
 
         if not return_dict:
@@ -466,6 +506,10 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
             self.config.lora['lora_dropout'] = model_args.lora_dropout
             self.config.lora['lora_bias'] = model_args.lora_bias
             self.config.lora['target_modules'] = model_args.train_modules
+        
+        if getattr(model_args, 'mone_enable', False):
+            self.config.mone['mone_r'] = model_args.mone_r
+            self.config.mone['mone_dropout'] = model_args.mone_dropout
 
         self.config.moe['moe_enable'] = model_args.moe_enable
         self.config.moe['train_modules'] = model_args.train_modules
@@ -537,6 +581,17 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                 assert all([torch.allclose(pretrained_state_dict[k], v) for k, v in loaded_state_dict.items()])
                 assert all([torch.allclose(loaded_state_dict[k], v) for k, v in pretrained_state_dict.items()])
                 
+        
+        # # 冻结普通MLP层，只训练MoE层
+        # for name, param in self.model.named_parameters():
+        #     # 如果是普通MLP层参数（不是MoE层）
+        #     if 'mlp' in name and 'deepspeed_moe' not in name:
+        #         param.requires_grad = False
+        #     # 可选：冻结其他非MLP层参数
+        #     elif 'mlp' not in name:
+        #         param.requires_grad = False  # 如果只想训练MoE部分
+        
+        
         rank0_print(f"LLM num_layers: {num_layers}, MoE num_layers: {len(moe_layers_idx)}, where\n",
                     *[f'layer-{layer_num} has {num_experts} experts\n' for num_experts, layer_num in
                       zip(self.config.moe['num_experts'], moe_layers_idx)])
@@ -548,6 +603,11 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
         
         self.model.forward = MoEQwen2VLModel_forward(self.model)
         rank0_print(f'replace Qwen2VLModel.forward to MoEQwen2VLModel.forward')
+
+    get_rope_index = Qwen2VLForConditionalGeneration.get_rope_index
+    prepare_inputs_for_generation = Qwen2VLForConditionalGeneration.prepare_inputs_for_generation
+    _get_image_nums_and_video_nums = Qwen2VLForConditionalGeneration._get_image_nums_and_video_nums
+    _expand_inputs_for_generation = Qwen2VLForConditionalGeneration._expand_inputs_for_generation
 
 
 class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration):
@@ -597,9 +657,14 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
         
         self.model.forward = MoEQwen2VLModel_forward(self.model)
         rank0_print(f'replace Qwen2VLModel.forward to MoEQwen2VLModel.forward')
+    
+    get_rope_index = Qwen2VLForConditionalGeneration.get_rope_index
+    prepare_inputs_for_generation = Qwen2VLForConditionalGeneration.prepare_inputs_for_generation
+    _get_image_nums_and_video_nums = Qwen2VLForConditionalGeneration._get_image_nums_and_video_nums
+    _expand_inputs_for_generation = Qwen2VLForConditionalGeneration._expand_inputs_for_generation
 
 
 # Register the new model with AutoConfig and AutoModel systems
 AutoConfig.register("moe_qwen2_vl", MoEQwen2VLConfig)
-AutoModelForConditionalGeneration.register(MoEQwen2VLConfig, MoEQwen2VLForConditionalGeneration)
-AutoModelForConditionalGeneration.register(MoEQwen2VLConfig, EvalMoEQwen2VLForConditionalGeneration)
+AutoModelForCausalLM.register(MoEQwen2VLConfig, MoEQwen2VLForConditionalGeneration)
+AutoModelForCausalLM.register(MoEQwen2VLConfig, EvalMoEQwen2VLForConditionalGeneration)
