@@ -42,6 +42,7 @@ class SmallExpert(nn.Module):
         x = self.dropout(x)
         x = self.up_proj(x)
         return x
+    
 
 # 定义组合层，结合原始MLP和MoE
 class CombinedLayer(nn.Module):
@@ -89,6 +90,7 @@ class MoEQwen2VLConfig(Qwen2VLConfig):
             train_modules=[]
         )
         self.lora = {}
+        self.mone = {}
 
         super(MoEQwen2VLConfig, self).__init__(**kwargs)
 
@@ -563,25 +565,56 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
 
         # Convert specified layers to MoE
         for num_experts, layer_num in zip(self.config.moe['num_experts'], moe_layers_idx):
-            pretrained_state_dict = self.model.layers[layer_num].mlp.state_dict()
-            self.model.layers[layer_num].mlp = MoE(
-                self.config.hidden_size,
-                expert=self.model.layers[layer_num].mlp,
-                num_experts=num_experts,
-                ep_size=model_args.ep_size,
-                k=model_args.top_k_experts,
-                capacity_factor=model_args.capacity_factor,
-                eval_capacity_factor=model_args.eval_capacity_factor,
-                min_capacity=model_args.min_capacity,
-                use_residual=model_args.use_residual,
-            )
-            # Verify weights are properly copied
-            for e in self.model.layers[layer_num].mlp.deepspeed_moe.experts.deepspeed_experts:
-                loaded_state_dict = e.state_dict()
-                assert all([torch.allclose(pretrained_state_dict[k], v) for k, v in loaded_state_dict.items()])
-                assert all([torch.allclose(loaded_state_dict[k], v) for k, v in pretrained_state_dict.items()])
+            if not getattr(model_args, 'mone_enable', False):
+                pretrained_state_dict = self.model.layers[layer_num].mlp.state_dict()
+                self.model.layers[layer_num].mlp = MoE(
+                    self.config.hidden_size,
+                    expert=self.model.layers[layer_num].mlp,
+                    num_experts=num_experts,
+                    ep_size=model_args.ep_size,
+                    k=model_args.top_k_experts,
+                    capacity_factor=model_args.capacity_factor,
+                    eval_capacity_factor=model_args.eval_capacity_factor,
+                    min_capacity=model_args.min_capacity,
+                    use_residual=model_args.use_residual,
+                )
+                # Verify weights are properly copied
+                for e in self.model.layers[layer_num].mlp.deepspeed_moe.experts.deepspeed_experts:
+                    loaded_state_dict = e.state_dict()
+                    assert all([torch.allclose(pretrained_state_dict[k], v) for k, v in loaded_state_dict.items()])
+                    assert all([torch.allclose(loaded_state_dict[k], v) for k, v in pretrained_state_dict.items()])
+            else:
+                rank0_print(f"Using MoE with Mixture of Nano Experts")
+                # 保存原始MLP
+                original_mlp = self.model.layers[layer_num].mlp
                 
-        
+                # 创建小专家实例
+                mone_r = self.config.mone['mone_r']
+                mone_dropout = self.config.mone['mone_dropout']
+                small_expert = SmallExpert(self.config.hidden_size, mone_r, mone_dropout)
+                
+                # 创建MoE层
+                moe_layer = MoE(
+                    self.config.hidden_size,
+                    expert=small_expert,  # 使用小专家
+                    num_experts=num_experts,
+                    ep_size=model_args.ep_size,
+                    k=model_args.top_k_experts,
+                    capacity_factor=model_args.capacity_factor,
+                    eval_capacity_factor=model_args.eval_capacity_factor,
+                    min_capacity=model_args.min_capacity,
+                    use_residual=model_args.use_residual,
+                )
+
+                # 替换原始MLP为组合层
+                self.model.layers[layer_num].mlp = CombinedLayer(original_mlp, moe_layer)
+
+                for name, param in self.model.named_parameters():
+                    if 'deepspeed_moe' in name:
+                        param.requires_grad = True
+                    # else:
+                    #     param.requires_grad = False
+
         # # 冻结普通MLP层，只训练MoE层
         # for name, param in self.model.named_parameters():
         #     # 如果是普通MLP层参数（不是MoE层）
@@ -628,6 +661,10 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
             )
             print("Adding LoRA adapters...")
             get_peft_model(self, lora_config)
+        
+        if getattr(self.config, 'mone', False) and self.config.mone.get('mone_enable', False):
+            mone_r = self.config.mone['mone_r']
+            mone_dropout = self.config.mone['mone_dropout'] 
 
         self.router_aux_loss_coef = self.config.moe['router_aux_loss_coef']
         num_layers = self.config.num_hidden_layers
@@ -635,17 +672,41 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
 
         # Reinitialize MoE layers for evaluation
         for num_experts, layer_num in zip(self.config.moe['num_experts'], moe_layers_idx):
-            self.model.layers[layer_num].mlp = MoE(
-                self.config.hidden_size,
-                expert=self.model.layers[layer_num].mlp,
-                num_experts=num_experts,
-                ep_size=self.config.moe['ep_size'],
-                k=self.config.moe['top_k_experts'],
-                capacity_factor=self.config.moe['capacity_factor'],
-                eval_capacity_factor=self.config.moe['eval_capacity_factor'],
-                min_capacity=self.config.moe['min_capacity'],
-                use_residual=self.config.moe['use_residual'],
-            )
+            if getattr(self.config, 'mone', False) and self.config.mone.get('mone_enable', False):
+                # 保存原始MLP
+                original_mlp = self.model.layers[layer_num].mlp
+
+                # 创建小专家实例
+                small_expert = SmallExpert(self.config.hidden_size, mone_r, mone_dropout)
+
+                # 创建MoE层
+                moe_layer = MoE(
+                    self.config.hidden_size,
+                    expert=small_expert,  # 使用小专家
+                    num_experts=num_experts,
+                    ep_size=self.config.moe['ep_size'],
+                    k=self.config.moe['top_k_experts'],
+                    capacity_factor=self.config.moe['capacity_factor'],
+                    eval_capacity_factor=self.config.moe['eval_capacity_factor'],
+                    min_capacity=self.config.moe['min_capacity'],
+                    use_residual=self.config.moe['use_residual'],
+                )
+
+                # 替换原始MLP为组合层
+                self.model.layers[layer_num].mlp = CombinedLayer(original_mlp, moe_layer)
+            else:
+                self.model.layers[layer_num].mlp = MoE(
+                    self.config.hidden_size,
+                    expert=self.model.layers[layer_num].mlp,
+                    num_experts=num_experts,
+                    ep_size=self.config.moe['ep_size'],
+                    k=self.config.moe['top_k_experts'],
+                    capacity_factor=self.config.moe['capacity_factor'],
+                    eval_capacity_factor=self.config.moe['eval_capacity_factor'],
+                    min_capacity=self.config.moe['min_capacity'],
+                    use_residual=self.config.moe['use_residual'],
+                )
+
         rank0_print(f"LLM num_layers: {num_layers}, MoE num_layers: {len(moe_layers_idx)}, where\n",
                     *[f'layer-{layer_num} has {num_experts} experts\n' for num_experts, layer_num in
                       zip(self.config.moe['num_experts'], moe_layers_idx)])
