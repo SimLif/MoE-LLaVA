@@ -27,18 +27,22 @@ from typing import Dict, Optional, Sequence, List
 
 import torch
 import transformers
+import numpy as np
+from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+from tqdm import tqdm
 
 from moellava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, \
     DEFAULT_IM_END_TOKEN, DEFAULT_VIDEO_TOKEN, DEFAULT_VID_START_TOKEN, DEFAULT_VID_END_TOKEN, MAX_IMAGE_LENGTH, \
     MAX_VIDEO_LENGTH
 from torch.utils.data import Dataset
-from moellava.train.llava_trainer import LLaVATrainer
+from moellava.train.llava_trainer import LLaVATrainer, QwenMoETrainer
 
 from moellava import conversation as conversation_lib
 from moellava.model import *
 from moellava.mm_utils import tokenizer_image_token
 from moellava.model.language_model.llava_qwen_moe import EvalMoELLaVAQWenForCausalLM
-from moellava.train.utils import replace_specific_moe_layer
+from moellava.train.utils import replace_specific_moe_layer, make_supervised_data_module_qwen2_vl
+from moellava.train.args import ModelArguments, DataArguments, TrainingArguments
 
 from PIL import Image
 from moellava.utils import order_pick_k
@@ -49,110 +53,6 @@ local_rank = None
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
-
-
-@dataclass
-class ModelArguments:
-    model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
-    version: Optional[str] = field(default="v0")
-    freeze_backbone: bool = field(default=False)
-    tune_mm_mlp_adapter: bool = field(default=False)
-    mm_vision_select_layer: Optional[int] = field(default=-1)   # default to the last layer
-    pretrain_mm_mlp_adapter: Optional[str] = field(default=None)
-    mm_use_im_start_end: bool = field(default=False)
-    mm_use_im_patch_token: bool = field(default=True)
-    mm_vision_select_feature: Optional[str] = field(default="patch")
-    # ===================================================================
-    image_tower: Optional[str] = field(default=None)
-    video_tower: Optional[str] = field(default=None)
-    image_projector_type: Optional[str] = field(default='linear')
-    video_projector_type: Optional[str] = field(default='linear')
-    video_global_proj: bool = field(default=False)
-    video_temproal_proj: bool = field(default=False)
-    video_spatial_proj: bool = field(default=False)
-    # ===================================================================
-
-    # =============================================================
-    only_lora_ffn: bool = True
-    moe_enable: bool = False
-    train_modules: Optional[List[str]] = field(default=None, metadata={"help": ""})
-    moe_mode: str = field(
-        default="second_half",
-        metadata={
-            "help": "The backend to be used for half precision.",
-            "choices": ["first_half", "second_half", "sparse", "dense"],
-        },
-    )
-    moe_layers_idx: Optional[List[int]] = field(default=None, metadata={"help": "where to place moe layers."})
-    ep_size: int = 1
-    num_experts: Optional[List[int]] = field(default=4, metadata={"help": "number of experts for each moe layer."})
-    top_k_experts: int = field(
-        default=2,
-        metadata={
-            "help": "Top-k experts to deal with tokens.",
-            "choices": [1, 2],
-        },
-    )
-    capacity_factor: float = 1.
-    eval_capacity_factor: float = 2.
-    min_capacity: int = 0
-    use_residual: bool = False
-    router_aux_loss_coef: float = 0.01
-    # =============================================================
-
-    skip_moe_init: bool = False
-    ffn_only: bool = False
-    load_k_experts: bool = False
-    k_experts_path: Optional[str] = None
-
-@dataclass
-class DataArguments:
-    lazy_preprocess: bool = False
-    is_multimodal: bool = False
-    image_aspect_ratio: str = 'square'
-    # ===================================================================
-    data_path: Optional[List[str]] = field(default=None, metadata={"help": "Path to the training data."})
-    image_folder: Optional[str] = field(default=None)
-    video_folder: Optional[str] = field(default=None)
-    num_frames: int = 8
-    # ===================================================================
-
-
-@dataclass
-class TrainingArguments(transformers.TrainingArguments):
-    cache_dir: Optional[str] = field(default=None)
-    optim: str = field(default="adamw_torch")
-    remove_unused_columns: bool = field(default=False)
-    freeze_mm_mlp_adapter: bool = field(default=False)
-    mpt_attn_impl: Optional[str] = field(default="triton")
-    model_max_length: int = field(
-        default=512,
-        metadata={
-            "help":
-            "Maximum sequence length. Sequences will be right padded (and possibly truncated)."
-        },
-    )
-    double_quant: bool = field(
-        default=True,
-        metadata={"help": "Compress the quantization statistics through double quantization."}
-    )
-    quant_type: str = field(
-        default="nf4",
-        metadata={"help": "Quantization data type to use. Should be one of `fp4` or `nf4`."}
-    )
-    bits: int = field(
-        default=16,
-        metadata={"help": "How many bits to use."}
-    )
-    lora_enable: bool = False
-    lora_r: int = 128
-    lora_alpha: int = 256
-    lora_dropout: float = 0.05
-    lora_weight_path: str = ""
-    lora_bias: str = "none"
-    mm_projector_lr: Optional[float] = None
-    group_by_modality_length: bool = field(default=False)
-
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -927,6 +827,74 @@ def expand2square(pil_img, background_color):
         result.paste(pil_img, ((height - width) // 2, 0))
         return result
 
+
+def analyze_data_lengths(dataset, max_length=None, sample_size=5, seed=42):
+    """
+    分析数据集中序列长度的统计信息
+    
+    参数:
+        dataset: 数据集对象
+        max_length: 最大长度阈值，用于计算截断比例
+        sample_size: 要采样的数据条数，如果为None则分析全部数据
+        seed: 随机种子，确保采样可重复
+    """
+    random.seed(seed)
+    
+    # 确定要分析的索引
+    total_size = len(dataset)
+    if sample_size is not None and sample_size < total_size:
+        # 随机采样
+        indices = random.sample(range(total_size), sample_size)
+        print(f"从{total_size}条数据中随机采样{sample_size}条进行统计...")
+    else:
+        indices = range(total_size)
+        print(f"正在统计全部{total_size}条数据的长度...")
+    
+    input_lengths = []
+    label_lengths = []
+    
+    for i in tqdm(indices):
+        item = dataset[i]
+        input_lengths.append(len(item['input_ids']))
+        label_lengths.append(len(item['labels']))
+    
+    input_lengths = np.array(input_lengths)
+    label_lengths = np.array(label_lengths)
+    
+    stats = {
+        "输入序列 (input_ids)": {
+            "最短长度": int(np.min(input_lengths)),
+            "最长长度": int(np.max(input_lengths)),
+            "平均长度": float(np.mean(input_lengths)),
+            "75%分位值": int(np.percentile(input_lengths, 75)),
+            "80%分位值": int(np.percentile(input_lengths, 80)),
+            "样本长度列表": input_lengths.tolist(),  # 添加原始长度列表供参考
+        },
+        "标签序列 (labels)": {
+            "最短长度": int(np.min(label_lengths)),
+            "最长长度": int(np.max(label_lengths)),
+            "平均长度": float(np.mean(label_lengths)),
+            "75%分位值": int(np.percentile(label_lengths, 75)),
+            "80%分位值": int(np.percentile(label_lengths, 80)),
+            "样本长度列表": label_lengths.tolist(),  # 添加原始长度列表供参考
+        }
+    }
+    
+    # 计算被截断的数据比例
+    if max_length is not None:
+        truncated_inputs = np.sum(input_lengths >= max_length)
+        truncated_labels = np.sum(label_lengths >= max_length)
+        
+        stats["截断统计"] = {
+            "输入序列截断数量": int(truncated_inputs),
+            "输入序列截断比例": f"{truncated_inputs / len(input_lengths) * 100:.2f}%",
+            "标签序列截断数量": int(truncated_labels),
+            "标签序列截断比例": f"{truncated_labels / len(label_lengths) * 100:.2f}%"
+        }
+    
+    return stats
+
+
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
@@ -1186,6 +1154,12 @@ def train():
                     cache_dir=training_args.cache_dir,
                     **bnb_model_from_pretrained_args
                 )
+            elif 'qwen2-vl' in model_args.model_name_or_path.lower():
+                model = Qwen2VLForConditionalGeneration.from_pretrained(
+                    model_args.model_name_or_path,
+                    cache_dir=training_args.cache_dir,
+                    **bnb_model_from_pretrained_args
+                )
             elif 'qwen' in model_args.model_name_or_path.lower() and '1.5' not in model_args.model_name_or_path.lower():
                 model = LlavaQWenForCausalLM.from_pretrained(
                     model_args.model_name_or_path,
@@ -1241,7 +1215,13 @@ def train():
                     **bnb_model_from_pretrained_args
                 )
         else:
-            if 'qwen' in model_args.model_name_or_path.lower() and '1.5' not in model_args.model_name_or_path.lower():
+            if 'qwen2-vl' in model_args.model_name_or_path.lower():
+                model = MoEQwen2VLForConditionalGeneration.from_pretrained(
+                    model_args.model_name_or_path,
+                    cache_dir=training_args.cache_dir,
+                    **bnb_model_from_pretrained_args
+                )
+            elif 'qwen' in model_args.model_name_or_path.lower() and '1.5' not in model_args.model_name_or_path.lower():
                 if model_args.skip_moe_init:
                     model = EvalMoELLaVAQWenForCausalLM.from_pretrained(
                         model_args.model_name_or_path,
@@ -1322,7 +1302,10 @@ def train():
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing)
 
     if training_args.gradient_checkpointing:
+        print("Enable gradient checkpointing")
+        model.gradient_checkpointing_enable()
         if hasattr(model, "enable_input_require_grads"):
+            print("Enable input require grads")
             model.enable_input_require_grads()
         else:
             def make_inputs_require_grad(module, input, output):
@@ -1431,7 +1414,22 @@ def train():
     else:
         # import ipdb
         # ipdb.set_trace()
-        if 'qwen' in model_args.model_name_or_path.lower() and '1.5' not in model_args.model_name_or_path.lower():
+        if 'qwen2-vl' in model_args.model_name_or_path.lower():
+            processor = AutoProcessor.from_pretrained(
+                model_args.model_name_or_path,
+                cache_dir=training_args.cache_dir,
+                # The default setting is padding_side="left"
+                # When training using the right-side padding is more efficient.
+                padding_side="right",
+                use_fast=False
+            )
+            processor.image_processor.min_pixels = data_args.image_min_pixels
+            processor.image_processor.max_pixels = data_args.image_max_pixels
+            tokenizer = processor.tokenizer
+            processor.tokenizer.model_max_length = training_args.model_max_length
+            model.config.tokenizer_model_max_length = training_args.model_max_length
+            model.config.tokenizer_padding_side = processor.tokenizer.padding_side
+        elif 'qwen' in model_args.model_name_or_path.lower() and '1.5' not in model_args.model_name_or_path.lower():
             from moellava.model.language_model.qwen.tokenization_qwen import QWenTokenizer
             tokenizer = QWenTokenizer.from_pretrained(
                 model_args.model_name_or_path,
@@ -1441,7 +1439,7 @@ def train():
                 use_fast=False,
             )
             tokenizer.add_special_tokens({'unk_token': '<|extra_0|>', 'eos_token': '<|endoftext|>'})
-        if 'qwen' in model_args.model_name_or_path.lower() and '1.5' in model_args.model_name_or_path.lower():
+        elif 'qwen' in model_args.model_name_or_path.lower() and '1.5' in model_args.model_name_or_path.lower():
             tokenizer = transformers.AutoTokenizer.from_pretrained(
                 model_args.model_name_or_path,
                 cache_dir=training_args.cache_dir,
@@ -1481,7 +1479,9 @@ def train():
     # ipdb.set_trace()
     # print(tokenizer)
     # print(tokenizer)
-    if model_args.version == "v0":
+    if 'qwen2-vl' in model_args.model_name_or_path.lower():
+        pass
+    elif model_args.version == "v0":
         if tokenizer.pad_token is None:
             smart_tokenizer_and_embedding_resize(
                 special_tokens_dict=dict(pad_token="[PAD]"),
@@ -1501,7 +1501,9 @@ def train():
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
     # print(conversation_lib.default_conversation)
     # =============================================================================================================
-    if model_args.image_tower is not None or model_args.video_tower is not None:
+    if 'qwen2-vl' in model_args.model_name_or_path.lower():
+        pass
+    elif model_args.image_tower is not None or model_args.video_tower is not None:
         # print(model_args)
         model.get_model().initialize_vision_modules(
             model_args=model_args,
@@ -1565,12 +1567,41 @@ def train():
     rank0_print(model)
     # sys.exit()
 
-    data_module = make_supervised_data_module(tokenizer=tokenizer,
+    if 'qwen2-vl' in model_args.model_name_or_path.lower():
+        data_module = make_supervised_data_module_qwen2_vl(
+            model_id=model_args.model_name_or_path,
+            processor=processor,
+            data_args=data_args
+        )
+    else:
+        data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
-    trainer = LLaVATrainer(model=model,
-                    tokenizer=tokenizer,
-                    args=training_args,
-                    **data_module)
+
+    # # 分析训练集长度分布
+    # max_length = training_args.model_max_length  # 假设这是你的最大长度参数
+    # train_stats = analyze_data_lengths(data_module['train_dataset'], max_length, sample_size=int(5*1e4))
+
+    # # 打印统计结果
+    # print("\n数据长度统计结果:")
+    # for key, value in train_stats.items():
+    #     print(f"\n{key}:")
+    #     for stat_name, stat_value in value.items():
+    #         print(f"  {stat_name}: {stat_value}")
+    
+    # return
+
+    if 'qwen2-vl' in model_args.model_name_or_path.lower():
+        trainer = QwenMoETrainer(
+            processor=processor,
+            model=model,
+            args=training_args,
+            **data_module
+        )
+    else:
+        trainer = LLaVATrainer(model=model,
+                        tokenizer=tokenizer,
+                        args=training_args,
+                        **data_module)
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
