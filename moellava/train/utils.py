@@ -10,8 +10,9 @@ from qwen_vl_utils import process_vision_info
 from PIL import Image
 import re
 
-from .train import DataArguments
-from ..constants import *
+from moellava.train.args import DataArguments
+from moellava.constants import *
+
 
 def replace_specific_moe_layer(model_a, model_b, layer_indices):
     """
@@ -126,6 +127,40 @@ def get_video_info(video_path, min_pixels, max_pixels, fps):
 
     return video_input[0], video_kwargs
 
+
+def pad_to_max_length(input_ids, labels, max_length, pad_token_id=0):
+    """
+    将 input_ids 和 labels 补齐到 max_length
+    
+    Args:
+        input_ids: 输入的 token ids
+        labels: 对应的标签
+        max_length: 目标长度
+        pad_token_id: 用于填充的 token id
+        
+    Returns:
+        补齐后的 input_ids 和 labels
+    """
+    current_length = input_ids.size(0)
+    
+    # 如果当前长度已经达到或超过最大长度，则不需要填充
+    if current_length >= max_length:
+        return input_ids, labels
+    
+    # 计算需要填充的长度
+    pad_length = max_length - current_length
+    
+    # 创建填充 tensor
+    pad_input_ids = torch.full((pad_length,), pad_token_id, dtype=input_ids.dtype, device=input_ids.device)
+    pad_labels = torch.full((pad_length,), IGNORE_INDEX, dtype=labels.dtype, device=labels.device)
+    
+    # 拼接原始 tensor 和填充 tensor
+    padded_input_ids = torch.cat([input_ids, pad_input_ids], dim=0)
+    padded_labels = torch.cat([labels, pad_labels], dim=0)
+    
+    return padded_input_ids, padded_labels
+
+
 class SupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
@@ -140,6 +175,13 @@ class SupervisedDataset(Dataset):
         super(SupervisedDataset, self).__init__()
         if isinstance(data_path, str):
             list_data_dict = json.load(open(data_path, "r"))
+        elif isinstance(data_path, list):
+            list_data_dict = []
+            for data in data_path:
+                data = json.load(open(data, "r"))
+                for i in data:
+                    i['id'] = len(list_data_dict)
+                    list_data_dict.append(i)
         else:
             list_data_dict = data_path
 
@@ -153,9 +195,21 @@ class SupervisedDataset(Dataset):
         self.video_min_pixel = data_args.video_min_pixels
         self.video_max_pixel = data_args.video_max_pixels
         self.fps = data_args.fps
+        self.max_length = processor.tokenizer.model_max_length
 
     def __len__(self):
         return len(self.list_data_dict)
+
+    @property
+    def modality_lengths(self):
+        length_list = []
+        for sample in self.list_data_dict:
+            cur_len = sum(len(conv['value'].split()) for conv in sample['conversations'])
+            # ===========================================================================
+            cur_len = cur_len if ('image' in sample or 'video' in sample) else -cur_len
+            # ===========================================================================
+            length_list.append(cur_len)
+        return length_list
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         sources = self.list_data_dict[i]
@@ -238,11 +292,12 @@ class SupervisedDataset(Dataset):
                 all_image_grid_thw.append(inputs[grid_key])
             
             elif QWEN2VL_VIDEO_TOKEN in user_input:
-                if "Qwen2.5" in self.model_id:
+                if 'qwen2-vl' in self.model_id:
+                    inputs = processor(text=[user_input], images=images, videos=videos, padding=False, return_tensors='pt')
+                else:
                     inputs = processor(text=[user_input], images=images, videos=videos, padding=False, return_tensors='pt', **video_kwargs)
                     all_second_gird.extend(inputs["second_per_grid_ts"])
-                else:
-                    inputs = processor(text=[user_input], images=images, videos=videos, padding=False, return_tensors='pt')
+                    
                 prompt_input_ids = inputs['input_ids']
                 all_pixel_values.append(inputs[pixel_key])
                 all_image_grid_thw.append(inputs[grid_key])
@@ -269,16 +324,23 @@ class SupervisedDataset(Dataset):
         input_ids = torch.cat(all_input_ids, dim=0).to(torch.long)
         labels = torch.cat(all_labels, dim=0).to(torch.long)
 
-        # eos_token_id = processor.tokenizer.convert_tokens_to_ids(QWEN2VL_IM_END_TOKEN)
-        # input_ids, labels = truncate_sequence(input_ids, labels, self.max_length, eos_token_id)
+        # input_ids, labels = pad_to_max_length(input_ids, labels, self.max_length)
+        eos_token_id = processor.tokenizer.convert_tokens_to_ids(QWEN2VL_IM_END_TOKEN)
+        input_ids, labels = truncate_sequence(input_ids, labels, self.max_length, eos_token_id)
 
         attention_mask = (input_ids > -1000000).to(torch.long)
+        
+        # print(f"len(input_ids): {len(input_ids)}")
 
         data_dict = dict(
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
         )
+
+        # show len
+        # print(f"len(input_ids): {len(input_ids)}")
+        # print(f"len(labels): {len(labels)}")
 
         if pixel_key and grid_key:
             pixel_values = torch.cat(all_pixel_values, dim=0)
@@ -377,7 +439,7 @@ def llava_to_openai(conversations, is_video=False):
 
     return transformed_data
 
-def make_supervised_data_module(model_id, processor, data_args):
+def make_supervised_data_module_qwen2_vl(model_id, processor, data_args):
     """Make dataset and collator for supervised fine-tuning."""
     sft_dataset = SupervisedDataset(
         data_path=data_args.data_path, processor=processor, data_args=data_args, model_id=model_id
