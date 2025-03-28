@@ -19,3 +19,5 @@ if a == '4' and int(b) >= 37:
     from .language_model.llava_qwen1_5_moe import MoELLaVAQwen1_5ForCausalLM, MoELLaVAQwen1_5Config
 if a == '4' and int(b) <= 31:
     from .language_model.llava_mpt import LlavaMPTForCausalLM, LlavaMPTConfig
+if a == '4' and int(b) >= 49:
+    from .multimodal_model.qwen2_vl_moe import MoEQwen2VLForConditionalGeneration, MoEQwen2VLConfig
