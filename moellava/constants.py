@@ -25,3 +25,14 @@ MAX_IMAGE_LENGTH = 16
 MAX_VIDEO_LENGTH = 1  # current video datasets only have 1 video?
 
 PAD_LENGTH = 620
+
+
+# ======================================================================================================
+# Qwen2-VL Constants
+QWEN2VL_SYSTEM_MESSAGE = "You are a helpful assistant."
+QWEN2VL_IM_START_TOKEN = "<|im_start|>"
+QWEN2VL_IM_END_TOKEN = "<|im_end|>"
+QWEN2VL_IMAGE_TOKEN = "<|image_pad|>"
+QWEN2VL_VIDEO_TOKEN = "<|video_pad|>"
+QWEN2VL_VISION_START_TOKEN = "<|vision_start|>"
+QWEN2VL_VISION_END_TOKEN = "<|vision_end|>"
