@@ -38,13 +38,7 @@ class ModelArguments:
     moe_layers_idx: Optional[List[int]] = field(default=None, metadata={"help": "where to place moe layers."})
     ep_size: int = 1
     num_experts: Optional[List[int]] = field(default=4, metadata={"help": "number of experts for each moe layer."})
-    top_k_experts: int = field(
-        default=2,
-        metadata={
-            "help": "Top-k experts to deal with tokens.",
-            "choices": [1, 2],
-        },
-    )
+    top_k_experts: int = 2
     capacity_factor: float = 1.
     eval_capacity_factor: float = 2.
     min_capacity: int = 0
@@ -56,6 +50,14 @@ class ModelArguments:
     ffn_only: bool = False
     load_k_experts: bool = False
     k_experts_path: Optional[str] = None
+    mone_enable: bool = False
+    mone_r: int = 128
+    mone_dropout: float = 0.00
+    mone_expert_type: str = "small_expert"
+    mone_gate_type: str = "token_gating"
+    mone_num_heads: int = 8
+    mone_use_query_bn: bool = True
+    mone_act_fn: str = "silu"
 
 @dataclass
 class DataArguments:
@@ -108,3 +110,5 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_bias: str = "none"
     mm_projector_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
+    vision_lr: Optional[float] = None
+    merger_lr: Optional[float] = None
