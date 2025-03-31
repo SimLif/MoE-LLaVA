@@ -445,7 +445,7 @@ class EmbeddedExpertsMoE(nn.Module):
         num_experts: int = 1024,  # 默认值较小，可以设置更大的值
         expert_dim: int = 1,      # 单神经元专家的内部维度
         k: int = 16,              # 每个token选择的专家数
-        gate_type: str = "topk",  # 专家选择门控类型
+        gate_type: str = "token_gating",  # 专家选择门控类型
         capacity_factor: float = 1.0,
         eval_capacity_factor: float = 1.0,
         min_capacity: int = 8,
@@ -479,7 +479,7 @@ class EmbeddedExpertsMoE(nn.Module):
         
         # 专家选择门控网络
         if gate_type == "token_gating":
-            self.gete = TopKGate(
+            self.gate = TopKGate(
                 model_dim=hidden_size,
                 num_experts=num_experts,
                 k=k,
@@ -556,11 +556,12 @@ class EmbeddedExpertsMoE(nn.Module):
 
         # 扁平化输入
         hidden_states = hidden_states.reshape(-1, hidden_size)  # [batch*seq, hidden]
+        orig_hidden = hidden_states.clone()
         batch_tokens = hidden_states.shape[0]
 
         # 获取专家路由信息
         if self.gate_type == "token_gating":
-            l_aux, combine_weights, dispatch_mask, exp_counts = self.gete(hidden_states, used_token)
+            l_aux, combine_weights, dispatch_mask, exp_counts = self.gate(hidden_states, used_token)
         elif self.gate_type == "similarity_gating":
             l_aux, combine_weights, dispatch_mask, exp_counts, expert_indices = self.gate(hidden_states, used_token)
         combine_weights = combine_weights.to(dtype=input_dtype)
@@ -618,7 +619,7 @@ class EmbeddedExpertsMoE(nn.Module):
         if len(active_positions) > 0:
             processed_mask[token_indices] = True
         unprocessed_mask = ~processed_mask  # 未处理 token 的 mask
-        outputs[unprocessed_mask] = hidden_states[unprocessed_mask]
+        outputs[unprocessed_mask] = orig_hidden[unprocessed_mask]
 
         # 重塑回原始形状
         outputs = outputs.reshape(original_shape)
@@ -643,7 +644,7 @@ class EmbeddedMoELayer(nn.Module):
         num_experts: int = 1024,
         expert_dim: int = 1,
         k: int = 16,
-        gate_type: str = "topk",
+        gate_type: str = "token_gating",
         capacity_factor: float = 1.0,
         eval_capacity_factor: float = 1.0,
         min_capacity: int = 8,
