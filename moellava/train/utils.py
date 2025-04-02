@@ -325,6 +325,7 @@ class SupervisedDataset(Dataset):
         labels = torch.cat(all_labels, dim=0).to(torch.long)
 
         # input_ids, labels = pad_to_max_length(input_ids, labels, self.max_length)
+        # print(f"len(input_ids): {len(input_ids)}")
         eos_token_id = processor.tokenizer.convert_tokens_to_ids(QWEN2VL_IM_END_TOKEN)
         input_ids, labels = truncate_sequence(input_ids, labels, self.max_length, eos_token_id)
 
