@@ -1562,6 +1562,7 @@ def train():
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
     for name, param in model.named_parameters():
+        # param.requires_grad = True
         if param.requires_grad:
             rank0_print(name)
     rank0_print(model)
