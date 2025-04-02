@@ -664,16 +664,17 @@ class EmbeddedMoELayer(nn.Module):
         self.use_pre_norm = use_pre_norm
         
         # 归一化层
-        if norm_type == "layernorm":
-            self.norm = nn.LayerNorm(hidden_size)
-        elif norm_type == "rmsnorm":
-            # 简单的RMSNorm实现
-            from functools import partial
-            def rms_norm(x, eps=1e-5):
-                return x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
-            self.norm = partial(rms_norm)
-        else:
-            raise ValueError(f"不支持的归一化类型: {norm_type}")
+        if use_norm:
+            if norm_type == "layernorm":
+                self.norm = nn.LayerNorm(hidden_size)
+            elif norm_type == "rmsnorm":
+                # 简单的RMSNorm实现
+                from functools import partial
+                def rms_norm(x, eps=1e-5):
+                    return x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
+                self.norm = partial(rms_norm)
+            else:
+                raise ValueError(f"不支持的归一化类型: {norm_type}")
         
         # MoE层
         self.moe = EmbeddedExpertsMoE(
