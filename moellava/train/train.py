@@ -41,7 +41,7 @@ from moellava import conversation as conversation_lib
 from moellava.model import *
 from moellava.mm_utils import tokenizer_image_token
 from moellava.model.language_model.llava_qwen_moe import EvalMoELLaVAQWenForCausalLM
-from moellava.train.utils import replace_specific_moe_layer, make_supervised_data_module_qwen2_vl
+from moellava.train.utils import initialize_moe_with_pretrained_weights, make_supervised_data_module_qwen2_vl
 from moellava.train.args import ModelArguments, DataArguments, TrainingArguments
 
 from PIL import Image
@@ -1396,13 +1396,22 @@ def train():
         rank0_print(f"Total number of trainable parameters: {total_trainable_params / 1e6:.2f}M")
 
     if model_args.load_k_experts:
-        model_k = LlavaQWenForCausalLM.from_pretrained(
-            model_args.k_experts_path,
-            cache_dir=training_args.cache_dir,
-            **bnb_model_from_pretrained_args
-        )
-        model = replace_specific_moe_layer(model, model_k, model.config.moe['moe_layers_idx'])
+        if 'llava-qwen' in model_args.model_name_or_path.lower():
+            model_k = LlavaQWenForCausalLM.from_pretrained(
+                model_args.k_experts_path,
+                cache_dir=training_args.cache_dir,
+                **bnb_model_from_pretrained_args
+            )
+            model = initialize_moe_with_pretrained_weights(model, model_k, model.config.moe['moe_layers_idx'], 'moe-llava-qwen')
+        elif 'qwen2-vl' in model_args.model_name_or_path.lower():
+            model_k = EvalMoEQwen2VLForConditionalGeneration.from_pretrained(
+                model_args.k_experts_path,
+                cache_dir=training_args.cache_dir,
+                **bnb_model_from_pretrained_args
+            )
+            model = initialize_moe_with_pretrained_weights(model, model_k, model.config.moe['moe_layers_idx'], 'moe-qwen2-vl')
         del model_k
+    return
 
     if 'mpt' in model_args.model_name_or_path:
         tokenizer = transformers.AutoTokenizer.from_pretrained(

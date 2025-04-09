@@ -14,41 +14,97 @@ from moellava.train.args import DataArguments
 from moellava.constants import *
 
 
-def replace_specific_moe_layer(model_a, model_b, layer_indices):
+def initialize_moe_with_pretrained_weights(model_new, model_pretrained, layer_indices, model_type):
     """
-    只替换指定层的MoE专家
-    
+    使用预热模型的参数初始化新构建MoE模型中的专家参数（以及可能的gate函数）。
+
     Args:
-        model_a: 包含MoE层的模型
-        model_b: 包含常规MLP层的模型
-        layer_indices: 要替换的层索引列表，如[2, 4, 6]
+        model_new: 新构建的MoE模型，其专家参数是随机初始化的
+        model_pretrained: 已预热或在其他领域训练后的模型，包含预期迁移的参数
+        layer_indices: 要替换的MoE层索引列表，例如 [2, 4, 6]
+        model_type: 模型类型标识，用于查找对应的参数映射配置，如 "moe-llava-qwen"
+
+    Returns:
+        初始化后的MoE模型
+
+    说明：
+        模型需要满足以下假设：
+        - MoE模型中的参数命名格式为：
+          "transformer.h.{i}.mlp.deepspeed_moe.experts.deepspeed_experts.0.[w1|w2|c_proj].weight"
+        - 预热模型中的参数命名格式为：
+          "transformer.h.{i}.mlp.[w1|w2|c_proj].weight"
+          
+        你可以在映射字典中添加其他模型类型的映射配置，也可以扩展参数列表来初始化gate等其他组件。
     """
-    state_dict_a = model_a.state_dict()
-    state_dict_b = model_b.state_dict()
-    
+    # 获取两个模型的 state dict
+    state_dict_new = model_new.state_dict()
+    state_dict_pre = model_pretrained.state_dict()
+
+    # 定义参数映射字典：目标(新MoE模型) 中的参数名称与预热模型中的参数名称
+    param_mappings = {
+        'moe-llava-qwen': {
+            'target_param_names': [
+                "transformer.h.{i}.mlp.deepspeed_moe.experts.deepspeed_experts.0.w1.weight",
+                "transformer.h.{i}.mlp.deepspeed_moe.experts.deepspeed_experts.0.w2.weight",
+                "transformer.h.{i}.mlp.deepspeed_moe.experts.deepspeed_experts.0.c_proj.weight",
+            ],
+            'source_param_names': [
+                "transformer.h.{i}.mlp.w1.weight",
+                "transformer.h.{i}.mlp.w2.weight",
+                "transformer.h.{i}.mlp.c_proj.weight",
+            ]
+        },
+        'moe-qwen2-vl': {
+            'target_param_names': [
+                # "model.layers.{i}.mlp.moe_layer.moe.gate.wg.weight",
+                "model.layers.{i}.mlp.moe_layer.moe.expert_down.weight",
+                "model.layers.{i}.mlp.moe_layer.moe.expert_up.weight",
+            ],
+            'source_param_names': [
+                # "model.layers.{i}.mlp.moe_layer.moe.gate.wg.weight",
+                "model.layers.{i}.mlp.moe_layer.moe.expert_down.weight",
+                "model.layers.{i}.mlp.moe_layer.moe.expert_up.weight",
+            ] 
+        }
+    }
+
+    if model_type not in param_mappings:
+        raise ValueError(f"不支持的模型类型: {model_type}")
+
+    mapping = param_mappings[model_type]
+    target_names = mapping['target_param_names']
+    source_names = mapping['source_param_names']
+
+    if len(target_names) != len(source_names):
+        raise ValueError("目标参数名称和源参数名称的数量不匹配")
+
+    # 针对每一层索引执行参数替换
     for i in layer_indices:
-        # 构建参数名
-        expert0_w1_name = f'transformer.h.{i}.mlp.deepspeed_moe.experts.deepspeed_experts.0.w1.weight'
-        expert0_w2_name = f'transformer.h.{i}.mlp.deepspeed_moe.experts.deepspeed_experts.0.w2.weight'
-        expert0_c_proj_name = f'transformer.h.{i}.mlp.deepspeed_moe.experts.deepspeed_experts.0.c_proj.weight'
-        
-        mlp_w1_name = f'transformer.h.{i}.mlp.w1.weight'
-        mlp_w2_name = f'transformer.h.{i}.mlp.w2.weight'
-        mlp_c_proj_name = f'transformer.h.{i}.mlp.c_proj.weight'
-        
-        # 进行替换
-        if all(name in state_dict_a for name in [expert0_w1_name, expert0_w2_name, expert0_c_proj_name]) and \
-           all(name in state_dict_b for name in [mlp_w1_name, mlp_w2_name, mlp_c_proj_name]):
-            
-            state_dict_a[expert0_w1_name] = state_dict_b[mlp_w1_name].clone()
-            state_dict_a[expert0_w2_name] = state_dict_b[mlp_w2_name].clone()
-            state_dict_a[expert0_c_proj_name] = state_dict_b[mlp_c_proj_name].clone()
-            print(f"已替换层 {i} 的MoE专家0")
+        all_params_found = True
+        # 将命名模板中的 {i} 填充为当前层索引
+        formatted_target_names = [name.format(i=i) for name in target_names]
+        formatted_source_names = [name.format(i=i) for name in source_names]
+
+        # 检查每一对参数是否存在于对应的 state_dict 中
+        for t_name, s_name in zip(formatted_target_names, formatted_source_names):
+            if t_name not in state_dict_new:
+                print(f"警告: 新模型中层 {i} 参数 {t_name} 不存在")
+                all_params_found = False
+            if s_name not in state_dict_pre:
+                print(f"警告: 预热模型中层 {i} 参数 {s_name} 不存在")
+                all_params_found = False
+
+        # 如果所有需替换的参数都存在，则执行替换操作
+        if all_params_found:
+            for t_name, s_name in zip(formatted_target_names, formatted_source_names):
+                state_dict_new[t_name] = state_dict_pre[s_name].clone()
+            print(f"成功初始化层 {i} 的MoE专家参数")
         else:
-            print(f"层 {i} 的某些参数不存在，无法替换")
-    
-    model_a.load_state_dict(state_dict_a)
-    return model_a
+            print(f"跳过层 {i} 的初始化，因为存在缺失的参数")
+
+    # 将更新后的 state_dict 加载进新模型
+    model_new.load_state_dict(state_dict_new)
+    return model_new
 
 
 
