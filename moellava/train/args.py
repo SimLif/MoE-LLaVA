@@ -58,6 +58,8 @@ class ModelArguments:
     mone_num_heads: int = 8
     mone_use_query_bn: bool = True
     mone_act_fn: str = "silu"
+    mone_use_expert_gate: bool = False
+    mone_load_original: bool = False
 
 @dataclass
 class DataArguments:
