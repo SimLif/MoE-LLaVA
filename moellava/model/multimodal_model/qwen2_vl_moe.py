@@ -237,8 +237,8 @@ class SimilarityGate(nn.Module):
         scores2 = torch.einsum('bhd,ed->bhe', query2, self.sub_keys2.float())  # [batch_tokens, num_heads, sqrt_experts]
 
         # 从两个子键集各获取k个最高分
-        top_scores1, top_indices1 = torch.topk(scores1, k=self.k, dim=-1)  # [batch_tokens, num_heads, k]
-        top_scores2, top_indices2 = torch.topk(scores2, k=self.k, dim=-1)  # [batch_tokens, num_heads, k]
+        top_scores1, top_indices1 = torch.topk(scores1, k=min(self.k, self.sqrt_experts), dim=-1)  # [batch_tokens, num_heads, k]
+        top_scores2, top_indices2 = torch.topk(scores2, k=min(self.k, self.sqrt_experts), dim=-1)  # [batch_tokens, num_heads, k]
 
         # 计算所有k²个可能组合的分数
         combined_scores = top_scores1.unsqueeze(-1) + top_scores2.unsqueeze(-2)  # [batch_tokens, num_heads, k, k]
@@ -248,8 +248,8 @@ class SimilarityGate(nn.Module):
         top_k_scores, top_k_indices = torch.topk(flat_scores, k=self.k, dim=-1)  # [batch_tokens, num_heads, k]
 
         # 计算原始k*k网格中的行列索引
-        i1_indices = top_k_indices // self.k  # 获取行索引 [batch_tokens, num_heads, k]
-        i2_indices = top_k_indices % self.k   # 获取列索引 [batch_tokens, num_heads, k]
+        i1_indices = top_k_indices // min(self.k, self.sqrt_experts)  # 获取行索引 [batch_tokens, num_heads, k]
+        i2_indices = top_k_indices % min(self.k, self.sqrt_experts)   # 获取列索引 [batch_tokens, num_heads, k]
 
         # 使用这些索引获取实际的子键索引
         selected_i1 = torch.gather(top_indices1, dim=2, index=i1_indices)  # [batch_tokens, num_heads, k]
