@@ -781,6 +781,209 @@ class EmbeddedMoELayer(nn.Module):
         return output, l_aux, exp_counts
 
 
+class DenseMaskMoE(nn.Module):
+    """
+    Dense Mask Mixture-of-Experts (MoE) 层基于 dense 运算 + mask 实现。
+
+    工作流程：
+      1. 使用 TopKGate 对输入进行专家路由，返回 (l_aux, combine_weights, dispatch_mask, exp_counts)。
+      2. 对 combine_weights（形状 [N, num_experts, capacity]）在 capacity 维度求和，
+         得到每个 token 对各专家的组合权重（形状 [N, num_experts]）。
+      3. 将所有专家的下投影权重融合成一个大矩阵，对输入执行一次 dense 运算，然后 reshape 得到各专家中间输出。
+      4. 应用激活和 dropout（或可选的专家门控）。
+      5. 利用 einsum 对各专家输出分别进行上投影，再用 combine_dense 加权求和，
+         生成最终 token 表示。
+    """
+    def __init__(
+        self,
+        hidden_size: int,
+        expert_dim: int,
+        num_experts: int,
+        k: int,
+        capacity_factor: float = 1.0,
+        eval_capacity_factor: float = 1.0,
+        min_capacity: int = 8,
+        dropout: float = 0.0,
+        activation: str = "silu",
+        use_expert_gate: bool = False
+    ):
+        """
+        Args:
+            hidden_size (int): 输入及输出的维度。
+            expert_dim (int): 每个专家的内部中间激活维度。
+            num_experts (int): 专家数量。
+            k (int): 每个 token 选择的 top-k 专家数。
+            capacity_factor (float): TopKGate 的 capacity_factor 参数。
+            eval_capacity_factor (float): TopKGate 的 eval_capacity_factor 参数。
+            min_capacity (int): TopKGate 的最小 capacity 参数。
+            dropout (float): dropout 概率。
+            activation (str): 激活函数类型，可选 "silu", "relu", "gelu"。
+            use_expert_gate (bool): 是否使用额外的专家门控参数。
+        """
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.expert_dim = expert_dim
+        self.num_experts = num_experts
+        self.k = k
+        self.use_expert_gate = use_expert_gate
+
+        # 使用 deepspeed 的 TopKGate 进行专家路由
+        self.gate = TopKGate(
+            model_dim=hidden_size,
+            num_experts=num_experts,
+            k=k,
+            capacity_factor=capacity_factor,
+            eval_capacity_factor=eval_capacity_factor,
+            min_capacity=min_capacity,
+            drop_tokens=True,
+        )
+
+        self.dropout = nn.Dropout(dropout)
+        
+        # 选择激活函数
+        if activation == "silu":
+            self.activation = F.silu
+        elif activation == "relu":
+            self.activation = F.relu
+        elif activation == "gelu":
+            self.activation = F.gelu
+        else:
+            raise ValueError(f"Unsupported activation: {activation}")
+
+        # 用 nn.Embedding 存储下投影参数，每个专家的参数 shape: [hidden_size * expert_dim]
+        self.expert_down_emb = nn.Embedding(num_experts, hidden_size * expert_dim)
+        # 初始化并乘上合适的缩放因子
+        nn.init.normal_(self.expert_down_emb.weight, std=math.sqrt(2.0 / (hidden_size + expert_dim)))
+        
+        # 上投影参数，每个专家的参数 shape: [expert_dim * hidden_size]
+        self.expert_up_emb = nn.Embedding(num_experts, expert_dim * hidden_size)
+        nn.init.normal_(self.expert_up_emb.weight, std=math.sqrt(1.0 / hidden_size))
+        
+        # 可选：专家内部门控参数，存储形状: [hidden_size * expert_dim]
+        if self.use_expert_gate:
+            self.expert_gate_emb = nn.Embedding(num_experts, hidden_size * expert_dim)
+            nn.init.normal_(self.expert_gate_emb.weight, std=math.sqrt(2.0 / (hidden_size + expert_dim)))
+
+
+    def count_expert_cooccurrence(self, combine_dense: torch.Tensor) -> torch.Tensor:
+        """
+        统计专家的共现情况。
+        
+        Args:
+            combine_dense (torch.Tensor): 形状为 [N, num_experts] 的张量，
+                每个 token 对各专家的激活权重（或者标志），非零表示激活。
+        
+        Returns:
+            co_occurrence_upper (torch.Tensor): 上三角的共现矩阵，形状为 [num_experts, num_experts]，
+                即 co_occurrence_upper[i, j] 表示专家 i 和专家 j 同时被激活的 token 数量（仅计算 i<j 部分）。
+        """
+        # 将 combine_dense 二值化（假定激活权重大于 0 表示激活）
+        # 如果 combine_dense 原本就是 0/1，则这个步骤可以省略
+        binary_mask = (combine_dense > 0).float()  # shape: [N, num_experts]
+        
+        # 计算共现矩阵：shape [num_experts, num_experts]
+        # 其中 entry (i, j) 表示有多少 token 同时激活了专家 i 和专家 j
+        co_occurrence = torch.matmul(binary_mask.transpose(0, 1), binary_mask)
+        
+        # 我们不关心自己与自己的共现，因此将对角线置 0
+        # co_occurrence.fill_diagonal_(0)
+        
+        # 如果只需要上三角部分（因为 C 是对称的）
+        co_occurrence_upper = torch.triu(co_occurrence, diagonal=1)
+        
+        return co_occurrence_upper
+    
+
+    def compute_jaccard_scores(self, co_occurrence: torch.Tensor, expert_activation_counts: torch.Tensor, min_count: int = 1):
+        """
+        根据 Jaccard 相似度计算专家对得分，并返回排名列表。
+        
+        Args:
+            co_occurrence (torch.Tensor): 专家共现矩阵，形状为 [num_experts, num_experts]（对角线为0）。
+            expert_activation_counts (torch.Tensor): 每个专家的激活总数，形状为 [num_experts]。
+            min_count (int): 只返回共现次数大于等于此阈值的专家对。
+            
+        Returns:
+            ranked_pairs (List[Tuple[int, int, float]]): 每个元素为 (expert_i, expert_j, jaccard_score)
+                值越大表示两个专家关系越紧密。
+        """
+        num_experts = co_occurrence.size(0)
+        pairs = []
+        for i in range(num_experts):
+            for j in range(i+1, num_experts):
+                co_count = co_occurrence[i, j].item()
+                if co_count < min_count:
+                    continue
+                # 计算两个专家的并集大小：C_i + C_j - C_ij
+                union = expert_activation_counts[i].item() + expert_activation_counts[j].item() - co_count
+                if union > 0:
+                    jaccard_score = co_count / union
+                    pairs.append((i, j, jaccard_score))
+        # 按照得分降序排序
+        ranked_pairs = sorted(pairs, key=lambda x: x[2], reverse=True)
+        return ranked_pairs
+
+
+    def forward(self, hidden_states: torch.Tensor):
+        """
+        Args:
+            hidden_states (torch.Tensor): 输入张量，形状为 [batch_size, seq_len, hidden_size] 或 [N, hidden_size]。
+
+        Returns:
+            output (torch.Tensor): 与输入形状一致的输出张量。
+            l_aux (torch.Tensor): 从 gate 返回的辅助负载均衡损失。
+            exp_counts (torch.Tensor): 各专家激活 token 的统计信息。
+        """
+        orig_shape = hidden_states.shape
+        # 将输入展平成 [N, hidden_size]
+        x = hidden_states.view(-1, self.hidden_size)
+        N = x.size(0)
+
+        # 1. 专家路由：得到 l_aux, combine_weights, dispatch_mask, exp_counts
+        l_aux, combine_weights, dispatch_mask, exp_counts = self.gate(x)
+        combine_weights = combine_weights.to(x.dtype)
+
+        # 将 combine_weights 在 capacity 维度上求和，形状：[N, num_experts]
+        combine_dense = combine_weights.sum(dim=-1)
+
+        # 2. Fused 下投影：
+        # 从 embedding 中恢复 expert_down_weight，形状为 [num_experts, hidden_size, expert_dim]
+        expert_down_weight = self.expert_down_emb.weight.view(self.num_experts, self.hidden_size, self.expert_dim)
+        # 将 expert_down_weight 转置并融合为 [hidden_size, num_experts * expert_dim]
+        fused_down = expert_down_weight.transpose(0, 1).reshape(self.hidden_size, self.num_experts * self.expert_dim)
+        # 对输入 x 做一次 dense 运算，获得中间输出：[N, num_experts * expert_dim]
+        intermediate_flat = x.matmul(fused_down)
+        # 变换形状到 [N, num_experts, expert_dim]
+        intermediate_all = intermediate_flat.view(N, self.num_experts, self.expert_dim)
+
+        # 3. 可选：专家内门控
+        if self.use_expert_gate:
+            # 从 embedding 中恢复 expert_gate_weight，形状为 [num_experts, hidden_size, expert_dim]
+            expert_gate_weight = self.expert_gate_emb.weight.view(self.num_experts, self.hidden_size, self.expert_dim)
+            fused_gate = expert_gate_weight.transpose(0, 1).reshape(self.hidden_size, self.num_experts * self.expert_dim)
+            gate_flat = x.matmul(fused_gate)
+            gate_vals = gate_flat.view(N, self.num_experts, self.expert_dim)
+            intermediate_all = intermediate_all * self.activation(gate_vals)
+        else:
+            intermediate_all = self.dropout(self.activation(intermediate_all))
+
+        # 4. 上投影及加权求和：
+        # 从 embedding 中恢复 expert_up_weight，形状为 [num_experts, expert_dim, hidden_size]
+        expert_up_weight = self.expert_up_emb.weight.view(self.num_experts, self.expert_dim, self.hidden_size)
+        # 计算公式：
+        #   output[n, h] = sum_{e, b} combine_dense[n, e] * intermediate_all[n, e, b] * expert_up_weight[e, b, h]
+        output = torch.einsum('ne, neb, ebh -> nh', combine_dense, intermediate_all, expert_up_weight)
+
+        # co_occurrence = self.count_expert_cooccurrence(combine_dense)
+        # ranked_pairs = self.compute_jaccard_scores(co_occurrence, exp_counts)
+        # print(f"Co-occurrence matrix: {co_occurrence}")
+        # print(f"Ranked pairs: {ranked_pairs[:3]}")
+
+        # 恢复原始形状（例如 [batch_size, seq_len, hidden_size]）
+        output = output.view(*orig_shape)
+        return output, l_aux, exp_counts
+
+
 class MoEQwen2VLConfig(Qwen2VLConfig):
     model_type = "moe_qwen2_vl"
 
