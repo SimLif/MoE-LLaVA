@@ -1433,6 +1433,7 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
             self.config.lora['target_modules'] = model_args.train_modules
         
         if getattr(model_args, 'mone_enable', False):
+            self.config.mone['mone_enable'] = model_args.mone_enable
             self.config.mone['mone_expert_type'] = model_args.mone_expert_type
             self.config.mone['mone_gate_type'] = model_args.mone_gate_type
             self.config.mone['mone_r'] = model_args.mone_r
@@ -1442,6 +1443,7 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
             self.config.mone['mone_act_fn'] = model_args.mone_act_fn
             self.config.mone['mone_use_expert_gate'] = model_args.mone_use_expert_gate
             self.config.mone['mone_load_original'] = model_args.mone_load_original
+            self.config.mone['mone_use_shared_expert'] = model_args.mone_use_shared_expert
 
         self.config.moe['moe_enable'] = model_args.moe_enable
         self.config.moe['train_modules'] = model_args.train_modules
@@ -1593,7 +1595,20 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                             print(f'Successfully initialized weights for {num_experts} experts in layer {layer_num}')
                     
                     if model_args.mone_use_shared_expert:
-                        moe_layer = CombinedLayer(original_mlp, moe_layer) 
+                        moe_layer = CombinedLayer(original_mlp, moe_layer)
+
+                elif model_args.mone_expert_type == 'dense_mask_expert':
+                    moe_layer = DenseMaskMoE(
+                        self.config.hidden_size,
+                        expert_dim=expert_dim,
+                        num_experts=num_experts,
+                        k=model_args.top_k_experts,
+                        capacity_factor=model_args.capacity_factor,
+                        eval_capacity_factor=model_args.eval_capacity_factor,
+                        min_capacity=model_args.min_capacity,
+                        use_expert_gate=model_args.mone_use_expert_gate,
+                    )
+
                 else:
                     raise NotImplementedError(f"Unsupported expert type: {model_args.mone_expert_type}")
 
