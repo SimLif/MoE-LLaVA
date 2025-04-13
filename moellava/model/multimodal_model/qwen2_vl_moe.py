@@ -544,39 +544,39 @@ class EmbeddedExpertsMoE(nn.Module):
         """MoE前向传播
         
         参数:
-            hidden_states: 形状为[batch_size, seq_len, hidden_size]的输入
-            used_token: 可选的掩码指示有效token
+            hidden_states: 形状为 [batch_size, seq_len, hidden_size] 的输入
+            used_token: 可选的掩码指示有效 token
             
         返回:
-            output: 模型输出
+            outputs: 模型输出
             l_aux: 负载均衡损失
             exp_counts: 专家计数
         """
-        # 保存原始形状和设备
         original_shape = hidden_states.shape
         batch_size, seq_len, hidden_size = original_shape
         device = hidden_states.device
         input_dtype = hidden_states.dtype
 
         # 扁平化输入
-        hidden_states = hidden_states.reshape(-1, hidden_size)  # [batch*seq, hidden]
+        hidden_states = hidden_states.reshape(-1, hidden_size)  # [N, hidden_size], N = batch_size * seq_len
         orig_hidden = hidden_states.clone()
         batch_tokens = hidden_states.shape[0]
 
-        # 获取专家路由信息
+        # 根据不同的门控获取路由信息
         if self.gate_type == "token_gating":
-            l_aux, combine_weights, dispatch_mask, exp_counts = self.gate(hidden_states, used_token)
+            l_aux, combine_weights, dispatch_mask, exp_counts = self.gate(hidden_states, used_token) # [N, num_experts, capacity]
         elif self.gate_type == "similarity_gating":
-            l_aux, combine_weights, dispatch_mask, exp_counts, expert_indices = self.gate(hidden_states, used_token)
+            l_aux, combine_weights, dispatch_mask, exp_counts, expert_indices = self.gate(hidden_states, used_token) # [N, topk, capacity], [N, expert_indices]
         combine_weights = combine_weights.to(dtype=input_dtype)
-        
-        # 计算专家输出
+
+        # 初始化输出
         outputs = torch.zeros((batch_tokens, hidden_size), device=device, dtype=hidden_states.dtype)
-                
-        # 使用选定的专家处理每个token
-        active_positions = torch.nonzero(dispatch_mask)
-        if len(active_positions) > 0:  # 确保有选定的专家
-            # 提取活跃位置的索引
+        
+        # 找到 dispatch_mask 中非零的位置（即被激活的 token）
+        active_positions = torch.nonzero(dispatch_mask)  # shape: [num_active, 3], 0th col: token index, 1st col: expert index, 2nd col: capacity index
+        
+        if active_positions.numel() > 0:
+            # 提取各个维度：第一列为 token 索引，第三列为 capacity 索引
             token_indices = active_positions[:, 0]
             capacity_indices = active_positions[:, 2]
             
@@ -584,6 +584,7 @@ class EmbeddedExpertsMoE(nn.Module):
                 expert_indices_from_mask = active_positions[:, 1]
             elif self.gate_type == "similarity_gating":
                 candidate_indices = active_positions[:, 1]
+                # 这里根据 gate 返回的 expert_indices，结合 candidate 索引提取真正的专家索引
                 expert_indices_from_mask = expert_indices[token_indices, candidate_indices]
 
             # 获取对应token的隐藏状态
