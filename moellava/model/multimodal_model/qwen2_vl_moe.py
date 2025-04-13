@@ -1455,7 +1455,7 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
         self.config.moe['min_capacity'] = model_args.min_capacity
         self.config.moe['use_residual'] = model_args.use_residual
         self.config.moe['router_aux_loss_coef'] = self.router_aux_loss_coef = model_args.router_aux_loss_coef
-        self.config.moe['use_shared_expert'] = model_args.use_shared_expert
+        self.config.moe['use_shared_experts'] = model_args.use_shared_experts
         
         # Freeze all parameters except those specified in train_modules
         if self.config.moe['train_modules'] is not None and len(self.config.moe['train_modules']) > 0:
@@ -1605,7 +1605,7 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                         moe_layer.expert_up_emb.weight.data.copy_(down_proj_weight_flat)
 
                     print(f'Successfully initialized weights for {num_experts} experts in layer {layer_num}')
-            if model_args.use_shared_expert:
+            if model_args.use_shared_experts:
                 moe_layer = CombinedLayer(self.model.layers[layer_num].mlp, moe_layer)
             self.model.layers[layer_num].mlp = moe_layer
 
@@ -1727,7 +1727,7 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
                     min_capacity=self.config.moe.get('min_capacity'),
                     use_residual=self.config.moe.get('use_residual'),
                 )
-            if self.config.moe.get('use_shared_expert', False):
+            if self.config.moe.get('use_shared_experts', False):
                 moe_layer = CombinedLayer(original_mlp, moe_layer)
             self.model.layers[layer_num].mlp = moe_layer
 
