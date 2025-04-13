@@ -626,7 +626,7 @@ class EmbeddedExpertsMoE(nn.Module):
                 token_indices_expanded = token_indices.unsqueeze(1).expand(-1, hidden_size)
                 weighted_outputs = flat_weights * expert_outputs
                 outputs.scatter_add_(0, token_indices_expanded, weighted_outputs)
-                
+
             elif self.forward_mode == "grouped":            
                 # 利用 unique 对激活 token 按照专家分组，减少重复的 embedding 查找和矩阵计算
                 unique_experts, inverse_indices = torch.unique(expert_indices_from_mask, return_inverse=True)
@@ -1440,7 +1440,8 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
             self.config.mone['mone_num_heads'] = model_args.mone_num_heads
             self.config.mone['mone_use_query_bn'] = model_args.mone_use_query_bn
             self.config.mone['mone_act_fn'] = model_args.mone_act_fn
-            self.config.mone['use_expert_gate'] = model_args.mone_use_expert_gate
+            self.config.mone['mone_use_expert_gate'] = model_args.mone_use_expert_gate
+            self.config.mone['mone_load_original'] = model_args.mone_load_original
 
         self.config.moe['moe_enable'] = model_args.moe_enable
         self.config.moe['train_modules'] = model_args.train_modules
@@ -1550,28 +1551,41 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                         use_query_bn=self.config.mone['mone_use_query_bn'],      # 使用批量归一化提高稳定性, True
                         act_fn=self.config.mone['mone_act_fn'],          # 可选: "relu", "gelu", "silu", silu
                         dropout=self.config.mone['mone_dropout'],            # 专家dropout率
-                        use_expert_gate=self.config.mone['use_expert_gate'],  # 是否使用专家门控
+                        use_expert_gate=self.config.mone['mone_use_expert_gate'],  # 是否使用专家门控
                     )
 
-                    # print(f'Layer {layer_num} Original MLP:')
-                    # for name, param in original_mlp.named_parameters():
-                    #     print(f'  {name}: {param.shape}')
-                    # print(f'Layer {layer_num} MoE Layer:')
-                    # for name, param in moe_layer.named_parameters():
-                    #     print(f'  {name}: {param.shape}')
                     if model_args.mone_load_original:
                         with torch.no_grad():
-                            gate_proj_weight = original_mlp.gate_proj.weight.data
-                            gate_proj_weight_reshaped = gate_proj_weight.view(num_experts, expert_dim, hidden_size)
-                            gate_proj_weight_flat = gate_proj_weight_reshaped.view(num_experts, expert_dim * hidden_size)
-                            moe_layer.moe.expert_gate.weight.data.copy_(gate_proj_weight_flat)
-
-                            up_proj_weight = original_mlp.up_proj.weight.data
-                            up_proj_weight_reshaped = up_proj_weight.view(num_experts, expert_dim, hidden_size)
-                            up_proj_weight_flat = up_proj_weight_reshaped.view(num_experts, expert_dim * hidden_size)
-                            moe_layer.moe.expert_down.weight.data.copy_(up_proj_weight_flat)
+                            intermediate_size = original_mlp.gate_proj.weight.data.shape[0]
+                            total_expert_dim = num_experts * expert_dim
                             
+                            if total_expert_dim % intermediate_size != 0:
+                                raise ValueError(
+                                    f"无法进行扩展初始化，因为 num_experts * expert_dim ({total_expert_dim}) "
+                                    f"不能整除 intermediate_size ({intermediate_size})"
+                                )
+                            
+                            m = total_expert_dim // intermediate_size  # 复制因子
+
+                            # ===== 初始化 expert_gate =====
+                            if self.config.mone['mone_use_expert_gate']:
+                                gate_proj_weight = original_mlp.gate_proj.weight.data # (intermediate_size, hidden_size)
+                                if m > 1:
+                                    gate_proj_weight = gate_proj_weight.repeat(m, 1) # (m * intermediate_size, hidden_size)
+                                gate_proj_weight_reshaped = gate_proj_weight.view(num_experts, expert_dim, hidden_size)
+                                gate_proj_weight_flat = gate_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
+                                moe_layer.moe.expert_gate.weight.data.copy_(gate_proj_weight_flat)
+                            
+                            up_proj_weight = original_mlp.up_proj.weight.data
+                            if m > 1:
+                                up_proj_weight = up_proj_weight.repeat(m, 1)
+                            up_proj_weight_reshaped = up_proj_weight.view(num_experts, expert_dim, hidden_size)
+                            up_proj_weight_flat = up_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
+                            moe_layer.moe.expert_down.weight.data.copy_(up_proj_weight_flat)
+
                             down_proj_weight = original_mlp.down_proj.weight.data.t()
+                            if m > 1:
+                                down_proj_weight = down_proj_weight.repeat(m, 1)
                             down_proj_weight_reshaped = down_proj_weight.view(num_experts, expert_dim, hidden_size)
                             down_proj_weight_flat = down_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
                             moe_layer.moe.expert_up.weight.data.copy_(down_proj_weight_flat)
