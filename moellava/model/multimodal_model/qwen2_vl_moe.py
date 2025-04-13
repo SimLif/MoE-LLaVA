@@ -1657,21 +1657,18 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
             get_peft_model(self, lora_config)
         
         if getattr(self.config, 'mone', False):
-            mone_expert_type = self.config.mone['mone_expert_type']
-            mone_gate_type = self.config.mone['mone_gate_type']
-            mone_r = self.config.mone['mone_r']
-            mone_dropout = self.config.mone['mone_dropout'] 
+            mone_expert_type = self.config.mone.get('mone_expert_type', 'embedding_expert')
 
         self.router_aux_loss_coef = self.config.moe['router_aux_loss_coef']
         num_layers = self.config.num_hidden_layers
         moe_layers_idx = self.config.moe['moe_layers_idx']
 
         # Reinitialize MoE layers for evaluation
-        for num_experts, layer_num in zip(self.config.moe['num_experts'], moe_layers_idx):
+        for num_experts, layer_num in zip(self.config.moe.get('num_experts'), moe_layers_idx):
+            original_mlp = self.model.layers[layer_num].mlp
             if getattr(self.config, 'mone', False):
-                original_mlp = self.model.layers[layer_num].mlp
-                mone_r = self.config.mone['mone_r']
-                mone_dropout = self.config.mone['mone_dropout']
+                mone_r = self.config.mone.get('mone_r', 2)
+                mone_dropout = self.config.mone.get('mone_dropout', 0.0)
                 
                 if mone_expert_type == 'small_expert':
                     # 创建小专家实例
@@ -1681,48 +1678,58 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
                         self.config.hidden_size,
                         expert=small_expert,  # 使用小专家
                         num_experts=num_experts,
-                        ep_size=self.config.moe['ep_size'],
-                        k=self.config.moe['top_k_experts'],
-                        capacity_factor=self.config.moe['capacity_factor'],
-                        eval_capacity_factor=self.config.moe['eval_capacity_factor'],
-                        min_capacity=self.config.moe['min_capacity'],
-                        use_residual=self.config.moe['use_residual'],
+                        ep_size=self.config.moe.get('ep_size'),
+                        k=self.config.moe.get('top_k_experts'),
+                        capacity_factor=self.config.moe.get('capacity_factor'),
+                        eval_capacity_factor=self.config.moe.get('eval_capacity_factor'),
+                        min_capacity=self.config.moe.get('min_capacity'),
+                        use_residual=self.config.moe.get('use_residual'),
                     )
                 elif mone_expert_type == 'embedding_expert':
                     moe_layer = EmbeddedMoELayer(
                         hidden_size=self.config.hidden_size,
                         num_experts=num_experts,  # 可设置为1M专家
-                        expert_dim=mone_r,           # 单神经元专家
-                        k=self.config.moe['top_k_experts'],                   # 每个token选择的专家数
-                        capacity_factor=self.config.moe['capacity_factor'],
-                        eval_capacity_factor=self.config.moe['eval_capacity_factor'],
-                        min_capacity=self.config.moe['min_capacity'],
-                        use_residual=self.config.moe['use_residual'],
-                        gate_type=self.config.mone['mone_gate_type'],
-                        num_heads=self.config.mone['mone_num_heads'],            # 多头专家选择, 8
-                        use_query_bn=self.config.mone['mone_use_query_bn'],      # 使用批量归一化提高稳定性, True
-                        act_fn=self.config.mone['mone_act_fn'],          # 可选: "relu", "gelu", "silu", silu
-                        dropout=self.config.mone['mone_dropout'],            # 专家dropout率
-                        use_expert_gate=self.config.mone['use_expert_gate'],  # 是否使用专家门控
+                        expert_dim=mone_r,        # 单神经元专家
+                        k=self.config.moe.get('top_k_experts'),
+                        gate_type=self.config.mone.get('mone_gate_type', 'token_gating'),
+                        capacity_factor=self.config.moe.get('capacity_factor'),
+                        eval_capacity_factor=self.config.moe.get('eval_capacity_factor'),
+                        min_capacity=self.config.moe.get('min_capacity'),
+                        use_residual=self.config.moe.get('use_residual'),
+                        num_heads=self.config.mone.get('mone_num_heads', 1),       # 多头专家选择
+                        use_query_bn=self.config.mone.get('mone_use_query_bn', False),   # 使用批量归一化提高稳定性
+                        act_fn=self.config.mone.get('mone_act_fn', 'silu'),               # 可选: "relu", "gelu", "silu"
+                        dropout=self.config.mone.get('mone_dropout', 0.0),             # 专家 dropout 率
+                        use_expert_gate=self.config.mone.get('use_expert_gate', False),    # 是否使用专家门控
+                    )
+                elif mone_expert_type == 'dense_mask_expert':
+                    moe_layer = DenseMaskMoE(
+                        self.config.hidden_size,
+                        expert_dim=mone_r,
+                        num_experts=num_experts,
+                        k=self.config.moe.get('top_k_experts'),
+                        capacity_factor=self.config.moe.get('capacity_factor'),
+                        eval_capacity_factor=self.config.moe.get('eval_capacity_factor'),
+                        min_capacity=self.config.moe.get('min_capacity'),
+                        use_expert_gate=self.config.mone.get('use_expert_gate', False),
                     )
                 else:
                     raise NotImplementedError(f"Unsupported expert type: {mone_expert_type}")
-                
-                # 替换原始MLP为组合层
-                # self.model.layers[layer_num].mlp = CombinedLayer(original_mlp, moe_layer)
-                self.model.layers[layer_num].mlp = moe_layer
             else:
-                self.model.layers[layer_num].mlp = MoE(
+                moe_layer = MoE(
                     self.config.hidden_size,
                     expert=self.model.layers[layer_num].mlp,
                     num_experts=num_experts,
-                    ep_size=self.config.moe['ep_size'],
-                    k=self.config.moe['top_k_experts'],
-                    capacity_factor=self.config.moe['capacity_factor'],
-                    eval_capacity_factor=self.config.moe['eval_capacity_factor'],
-                    min_capacity=self.config.moe['min_capacity'],
-                    use_residual=self.config.moe['use_residual'],
+                    ep_size=self.config.moe.get('ep_size'),
+                    k=self.config.moe.get('top_k_experts'),
+                    capacity_factor=self.config.moe.get('capacity_factor'),
+                    eval_capacity_factor=self.config.moe.get('eval_capacity_factor'),
+                    min_capacity=self.config.moe.get('min_capacity'),
+                    use_residual=self.config.moe.get('use_residual'),
                 )
+            if self.config.moe.get('use_shared_expert', False):
+                moe_layer = CombinedLayer(original_mlp, moe_layer)
+            self.model.layers[layer_num].mlp = moe_layer
 
         rank0_print(f"LLM num_layers: {num_layers}, MoE num_layers: {len(moe_layers_idx)}, where\n",
                     *[f'layer-{layer_num} has {num_experts} experts\n' for num_experts, layer_num in
@@ -1746,3 +1753,4 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
 AutoConfig.register("moe_qwen2_vl", MoEQwen2VLConfig)
 AutoModelForCausalLM.register(MoEQwen2VLConfig, MoEQwen2VLForConditionalGeneration)
 AutoModelForCausalLM.register(MoEQwen2VLConfig, EvalMoEQwen2VLForConditionalGeneration)
+
