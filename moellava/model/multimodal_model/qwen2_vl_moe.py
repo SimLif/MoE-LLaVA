@@ -1443,7 +1443,6 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
             self.config.mone['mone_act_fn'] = model_args.mone_act_fn
             self.config.mone['mone_use_expert_gate'] = model_args.mone_use_expert_gate
             self.config.mone['mone_load_original'] = model_args.mone_load_original
-            self.config.mone['mone_use_shared_expert'] = model_args.mone_use_shared_expert
 
         self.config.moe['moe_enable'] = model_args.moe_enable
         self.config.moe['train_modules'] = model_args.train_modules
@@ -1456,6 +1455,7 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
         self.config.moe['min_capacity'] = model_args.min_capacity
         self.config.moe['use_residual'] = model_args.use_residual
         self.config.moe['router_aux_loss_coef'] = self.router_aux_loss_coef = model_args.router_aux_loss_coef
+        self.config.moe['use_shared_expert'] = model_args.use_shared_expert
         
         # Freeze all parameters except those specified in train_modules
         if self.config.moe['train_modules'] is not None and len(self.config.moe['train_modules']) > 0:
@@ -1497,9 +1497,10 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
 
         # Convert specified layers to MoE
         for num_experts, layer_num in zip(self.config.moe['num_experts'], moe_layers_idx):
+            original_mlp = self.model.layers[layer_num].mlp
             if not getattr(model_args, 'mone_enable', False):
-                pretrained_state_dict = self.model.layers[layer_num].mlp.state_dict()
-                self.model.layers[layer_num].mlp = MoE(
+                pretrained_state_dict = original_mlp.state_dict()
+                moe_layer = MoE(
                     self.config.hidden_size,
                     expert=self.model.layers[layer_num].mlp,
                     num_experts=num_experts,
@@ -1511,14 +1512,11 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                     use_residual=model_args.use_residual,
                 )
                 # Verify weights are properly copied
-                for e in self.model.layers[layer_num].mlp.deepspeed_moe.experts.deepspeed_experts:
+                for e in moe_layer.deepspeed_moe.experts.deepspeed_experts:
                     loaded_state_dict = e.state_dict()
                     assert all([torch.allclose(pretrained_state_dict[k], v) for k, v in loaded_state_dict.items()])
                     assert all([torch.allclose(loaded_state_dict[k], v) for k, v in pretrained_state_dict.items()])
             else:
-                rank0_print(f"Using MoE with Mixture of Nano Experts")
-                # 保存原始MLP
-                original_mlp = self.model.layers[layer_num].mlp
                 hidden_size = self.config.hidden_size
                 mone_r = expert_dim = self.config.mone['mone_r']
                 mone_dropout = self.config.mone['mone_dropout']
@@ -1555,48 +1553,6 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                         dropout=self.config.mone['mone_dropout'],            # 专家dropout率
                         use_expert_gate=self.config.mone['mone_use_expert_gate'],  # 是否使用专家门控
                     )
-
-                    if model_args.mone_load_original:
-                        with torch.no_grad():
-                            intermediate_size = original_mlp.gate_proj.weight.data.shape[0]
-                            total_expert_dim = num_experts * expert_dim
-                            
-                            if total_expert_dim % intermediate_size != 0:
-                                raise ValueError(
-                                    f"无法进行扩展初始化，因为 num_experts * expert_dim ({total_expert_dim}) "
-                                    f"不能整除 intermediate_size ({intermediate_size})"
-                                )
-                            
-                            m = total_expert_dim // intermediate_size  # 复制因子
-
-                            # ===== 初始化 expert_gate =====
-                            if self.config.mone['mone_use_expert_gate']:
-                                gate_proj_weight = original_mlp.gate_proj.weight.data # (intermediate_size, hidden_size)
-                                if m > 1:
-                                    gate_proj_weight = gate_proj_weight.repeat(m, 1) # (m * intermediate_size, hidden_size)
-                                gate_proj_weight_reshaped = gate_proj_weight.view(num_experts, expert_dim, hidden_size)
-                                gate_proj_weight_flat = gate_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
-                                moe_layer.moe.expert_gate.weight.data.copy_(gate_proj_weight_flat)
-                            
-                            up_proj_weight = original_mlp.up_proj.weight.data
-                            if m > 1:
-                                up_proj_weight = up_proj_weight.repeat(m, 1)
-                            up_proj_weight_reshaped = up_proj_weight.view(num_experts, expert_dim, hidden_size)
-                            up_proj_weight_flat = up_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
-                            moe_layer.moe.expert_down.weight.data.copy_(up_proj_weight_flat)
-
-                            down_proj_weight = original_mlp.down_proj.weight.data.t()
-                            if m > 1:
-                                down_proj_weight = down_proj_weight.repeat(m, 1)
-                            down_proj_weight_reshaped = down_proj_weight.view(num_experts, expert_dim, hidden_size)
-                            down_proj_weight_flat = down_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
-                            moe_layer.moe.expert_up.weight.data.copy_(down_proj_weight_flat)
-
-                            print(f'Successfully initialized weights for {num_experts} experts in layer {layer_num}')
-                    
-                    if model_args.mone_use_shared_expert:
-                        moe_layer = CombinedLayer(original_mlp, moe_layer)
-
                 elif model_args.mone_expert_type == 'dense_mask_expert':
                     moe_layer = DenseMaskMoE(
                         self.config.hidden_size,
@@ -1608,17 +1564,50 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                         min_capacity=model_args.min_capacity,
                         use_expert_gate=model_args.mone_use_expert_gate,
                     )
-
                 else:
                     raise NotImplementedError(f"Unsupported expert type: {model_args.mone_expert_type}")
 
-                self.model.layers[layer_num].mlp = CombinedLayer(original_mlp, moe_layer)
+            if model_args.mone_load_original:
+                with torch.no_grad():
+                    intermediate_size = original_mlp.gate_proj.weight.data.shape[0]
+                    total_expert_dim = num_experts * expert_dim
+                    if total_expert_dim % intermediate_size != 0:
+                        raise ValueError(
+                            f"无法进行扩展初始化，因为 num_experts * expert_dim ({total_expert_dim}) "
+                            f"不能整除 intermediate_size ({intermediate_size})"
+                        )
+                    m = total_expert_dim // intermediate_size  # 复制因子
 
-                # for name, param in self.model.named_parameters():
-                #     if 'deepspeed_moe' in name:
-                #         param.requires_grad = True
-                #     else:
-                #         param.requires_grad = False
+                    if self.config.mone['mone_use_expert_gate']:
+                        gate_proj_weight = original_mlp.gate_proj.weight.data # (intermediate_size, hidden_size)
+                        if m > 1:
+                            gate_proj_weight = gate_proj_weight.repeat(m, 1) # (m * intermediate_size, hidden_size)
+                        gate_proj_weight_reshaped = gate_proj_weight.view(num_experts, expert_dim, hidden_size)
+                        gate_proj_weight_flat = gate_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
+                    up_proj_weight = original_mlp.up_proj.weight.data
+                    if m > 1:
+                        up_proj_weight = up_proj_weight.repeat(m, 1)
+                    up_proj_weight_reshaped = up_proj_weight.view(num_experts, expert_dim, hidden_size)
+                    up_proj_weight_flat = up_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
+                    down_proj_weight = original_mlp.down_proj.weight.data.t()
+                    if m > 1:
+                        down_proj_weight = down_proj_weight.repeat(m, 1)
+                    down_proj_weight_reshaped = down_proj_weight.view(num_experts, expert_dim, hidden_size)
+                    down_proj_weight_flat = down_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
+                    
+                    if model_args.mone_expert_type == 'embedding_expert':
+                        moe_layer.moe.expert_gate.weight.data.copy_(gate_proj_weight_flat)
+                        moe_layer.moe.expert_down.weight.data.copy_(up_proj_weight_flat)
+                        moe_layer.moe.expert_up.weight.data.copy_(down_proj_weight_flat)
+                    elif model_args.mone_expert_type == 'dense_mask_expert':
+                        moe_layer.expert_gate_emb.weight.data.copy_(gate_proj_weight_flat)
+                        moe_layer.expert_down_emb.weight.data.copy_(up_proj_weight_flat)
+                        moe_layer.expert_up_emb.weight.data.copy_(down_proj_weight_flat)
+
+                    print(f'Successfully initialized weights for {num_experts} experts in layer {layer_num}')
+            if model_args.use_shared_expert:
+                moe_layer = CombinedLayer(self.model.layers[layer_num].mlp, moe_layer)
+            self.model.layers[layer_num].mlp = moe_layer
 
         # # 冻结普通MLP层，只训练MoE层
         # for name, param in self.model.named_parameters():
