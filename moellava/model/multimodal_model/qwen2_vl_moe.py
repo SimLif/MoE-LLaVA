@@ -1591,14 +1591,13 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                             moe_layer.moe.expert_up.weight.data.copy_(down_proj_weight_flat)
 
                             print(f'Successfully initialized weights for {num_experts} experts in layer {layer_num}')
+                    
+                    if model_args.mone_use_shared_expert:
+                        moe_layer = CombinedLayer(original_mlp, moe_layer) 
                 else:
                     raise NotImplementedError(f"Unsupported expert type: {model_args.mone_expert_type}")
-                
-                # 替换原始MLP为组合层
-                if model_args.mone_load_original:
-                    self.model.layers[layer_num].mlp = moe_layer
-                else:
-                    self.model.layers[layer_num].mlp = CombinedLayer(original_mlp, moe_layer)
+
+                self.model.layers[layer_num].mlp = CombinedLayer(original_mlp, moe_layer)
 
                 # for name, param in self.model.named_parameters():
                 #     if 'deepspeed_moe' in name:
