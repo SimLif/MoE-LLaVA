@@ -459,6 +459,7 @@ class EmbeddedExpertsMoE(nn.Module):
         init_scale: float = 1.0,     # 初始化缩放
         expert_parallel: bool = False, # 是否并行化专家
         use_expert_gate: bool = False, # 是否启用针对每个专家的 gate 模块
+        forward_mode: str = "batched", # 前向传播模式
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__()
@@ -471,6 +472,7 @@ class EmbeddedExpertsMoE(nn.Module):
         self.use_residual = use_residual
         self.expert_parallel = expert_parallel
         self.use_expert_gate = use_expert_gate
+        self.forward_mode = forward_mode
         self.ep_group = ep_group
         
         # 专家选择门控网络
@@ -587,45 +589,93 @@ class EmbeddedExpertsMoE(nn.Module):
                 # 这里根据 gate 返回的 expert_indices，结合 candidate 索引提取真正的专家索引
                 expert_indices_from_mask = expert_indices[token_indices, candidate_indices]
 
-            # 获取对应token的隐藏状态
-            flat_hidden = hidden_states[token_indices]
-            
-            # 获取专家参数 - 使用从dispatch_mask获取的专家索引
-            expert_down_w = self.expert_down(expert_indices_from_mask)  # [active_tokens, hidden*expert_dim]
-            expert_up_w = self.expert_up(expert_indices_from_mask)  # [active_tokens, expert_dim*hidden]
-            
-            # 重塑为矩阵形式
-            expert_down_w = expert_down_w.view(-1, hidden_size, self.expert_dim)
-            expert_up_w = expert_up_w.view(-1, self.expert_dim, hidden_size)
-            
-            # 计算中间激活
-            intermediate = torch.bmm(flat_hidden.unsqueeze(1), expert_down_w).squeeze(1)
-            if self.use_expert_gate:
-                expert_gate_w = self.expert_gate(expert_indices_from_mask)
-                expert_gate_w = expert_gate_w.view(-1, hidden_size, self.expert_dim)
-                gate_value = torch.bmm(flat_hidden.unsqueeze(1), expert_gate_w).squeeze(1)
-                gate_value = self.activation(gate_value)
-                intermediate = intermediate * gate_value
-            else:
-                intermediate = self.activation(intermediate)
-                intermediate = self.dropout(intermediate)
-            
-            # 计算输出
-            expert_outputs = torch.bmm(intermediate.unsqueeze(1), expert_up_w).squeeze(1)
-            
-            # 根据 combine_weights 获得组合权重
-            if self.gate_type == "token_gating":
-                flat_weights = combine_weights[token_indices, expert_indices_from_mask, capacity_indices].unsqueeze(1)
-            elif self.gate_type == "similarity_gating":
-                flat_weights = combine_weights[token_indices, candidate_indices, capacity_indices].unsqueeze(1)
-            
-            # 加权叠加专家输出到对应 token 上
-            token_indices_expanded = token_indices.unsqueeze(1).expand(-1, hidden_size)
-            weighted_outputs = flat_weights * expert_outputs
-            outputs.scatter_add_(0, token_indices_expanded, weighted_outputs)
+            if self.forward_mode == "batched":
+                # 获取对应token的隐藏状态
+                flat_hidden = hidden_states[token_indices]
+                
+                # 获取专家参数 - 使用从dispatch_mask获取的专家索引
+                expert_down_w = self.expert_down(expert_indices_from_mask)  # [active_tokens, hidden*expert_dim]
+                expert_up_w = self.expert_up(expert_indices_from_mask)  # [active_tokens, expert_dim*hidden]
+                
+                # 重塑为矩阵形式
+                expert_down_w = expert_down_w.view(-1, hidden_size, self.expert_dim)
+                expert_up_w = expert_up_w.view(-1, self.expert_dim, hidden_size)
+                
+                # 计算中间激活
+                intermediate = torch.bmm(flat_hidden.unsqueeze(1), expert_down_w).squeeze(1)
+                if self.use_expert_gate:
+                    expert_gate_w = self.expert_gate(expert_indices_from_mask)
+                    expert_gate_w = expert_gate_w.view(-1, hidden_size, self.expert_dim)
+                    gate_value = torch.bmm(flat_hidden.unsqueeze(1), expert_gate_w).squeeze(1)
+                    gate_value = self.activation(gate_value)
+                    intermediate = intermediate * gate_value
+                else:
+                    intermediate = self.activation(intermediate)
+                    intermediate = self.dropout(intermediate)
+                
+                # 计算输出
+                expert_outputs = torch.bmm(intermediate.unsqueeze(1), expert_up_w).squeeze(1)
+                
+                # 根据 combine_weights 获得组合权重
+                if self.gate_type == "token_gating":
+                    flat_weights = combine_weights[token_indices, expert_indices_from_mask, capacity_indices].unsqueeze(1)
+                elif self.gate_type == "similarity_gating":
+                    flat_weights = combine_weights[token_indices, candidate_indices, capacity_indices].unsqueeze(1)
+                
+                # 加权叠加专家输出到对应 token 上
+                token_indices_expanded = token_indices.unsqueeze(1).expand(-1, hidden_size)
+                weighted_outputs = flat_weights * expert_outputs
+                outputs.scatter_add_(0, token_indices_expanded, weighted_outputs)
+                
+            elif self.forward_mode == "grouped":            
+                # 利用 unique 对激活 token 按照专家分组，减少重复的 embedding 查找和矩阵计算
+                unique_experts, inverse_indices = torch.unique(expert_indices_from_mask, return_inverse=True)
+                # 对每个唯一的 expert 分组计算
+                for i, expert in enumerate(unique_experts):
+                    exp_id = int(expert.item())
+                    # 找出分组内对应的 token 在扁平化输入中的下标
+                    group_mask = (inverse_indices == i)
+                    group_token_indices = token_indices[group_mask]  # token的全局索引
+                    group_capacity_indices = capacity_indices[group_mask]
+                    
+                    # 取出这部分 tokens 的 hidden 表示，形状 [group_size, hidden_size]
+                    tokens_group = hidden_states[group_token_indices]
+                    
+                    # 查找当前 expert 的 down/up（及可选 gate）参数，并重塑为矩阵形式
+                    expert_down_weight = self.expert_down.weight[exp_id].view(hidden_size, self.expert_dim)
+                    expert_up_weight = self.expert_up.weight[exp_id].view(self.expert_dim, hidden_size)
+
+                    # 下投影计算：tokens_group @ expert_down_weight，得到中间激活
+                    intermediate = tokens_group.matmul(expert_down_weight)  # [G, expert_dim]
+                    
+                    if self.use_expert_gate:
+                        expert_gate_weight = self.expert_gate.weight[exp_id].view(hidden_size, self.expert_dim)
+                        gate_value = tokens_group.matmul(expert_gate_weight)  # [G, expert_dim]
+                        gate_value = self.activation(gate_value)
+                        intermediate = intermediate * gate_value
+                    else:
+                        intermediate = self.activation(intermediate)
+                        intermediate = self.dropout(intermediate)
+                    
+                    # 上投影计算
+                    expert_output = intermediate.matmul(expert_up_weight)  # [G, hidden_size]
+
+                    # 根据不同的门控获取每个 token 特有的组合权重
+                    if self.gate_type == "token_gating":
+                        # combine_weights 的形状为 [B*T, num_experts, capacity]
+                        group_combine_weights = combine_weights[group_token_indices, exp_id, group_capacity_indices].unsqueeze(1)
+                    elif self.gate_type == "similarity_gating":
+                        group_candidate_indices = candidate_indices[group_mask]
+                        group_combine_weights = combine_weights[group_token_indices, group_candidate_indices, group_capacity_indices].unsqueeze(1)
+                    
+                    weighted_output = expert_output * group_combine_weights  # [G, hidden_size]
+                    
+                    # 将当前 expert 组的输出累加回输出 tensor
+                    outputs[group_token_indices] += weighted_output
         
+        # 对于未经过 MoE 调度的 token，则保留原始表示
         processed_mask = torch.zeros(batch_tokens, dtype=torch.bool, device=device)
-        if len(active_positions) > 0:
+        if active_positions.numel() > 0:
             processed_mask[token_indices] = True
         unprocessed_mask = ~processed_mask
         outputs[unprocessed_mask] = orig_hidden[unprocessed_mask]
