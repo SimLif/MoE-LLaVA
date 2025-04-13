@@ -486,7 +486,7 @@ class EmbeddedExpertsMoE(nn.Module):
                 ep_group=ep_group,
             )
         elif gate_type == "similarity_gating":
-            # 需要确保num_experts是完全平方数
+            # 确保 num_experts 是完全平方数，否则调整到最近的完全平方数
             sqrt_experts = math.sqrt(num_experts)
             if sqrt_experts != int(sqrt_experts):
                 new_sqrt = math.ceil(sqrt_experts)
@@ -520,27 +520,25 @@ class EmbeddedExpertsMoE(nn.Module):
             self.activation = F.relu
         elif act_fn == "gelu":
             self.activation = F.gelu
-        elif act_fn == "silu" or act_fn == "swish":
+        elif act_fn in ["silu", "swish"]:
             self.activation = F.silu
         else:
             raise ValueError(f"不支持的激活函数: {act_fn}")
         
-        # Dropout层
         self.dropout = nn.Dropout(dropout)
         
-        # 可选的残差系数
         if use_residual:
             self.coefficient = nn.Linear(hidden_size, 2)
         
         # 初始化参数
         with torch.no_grad():
             # 使用高斯初始化下投影权重
-            std = math.sqrt(2.0 / (hidden_size + expert_dim)) * init_scale
-            nn.init.normal_(self.expert_down.weight, mean=0.0, std=std)
+            std_down = math.sqrt(2.0 / (hidden_size + expert_dim)) * init_scale
+            nn.init.normal_(self.expert_down.weight, mean=0.0, std=std_down)
             
             # 使用高斯初始化上投影权重
-            std = math.sqrt(1.0 / hidden_size) * init_scale
-            nn.init.normal_(self.expert_up.weight, mean=0.0, std=std)
+            std_up = math.sqrt(1.0 / hidden_size) * init_scale
+            nn.init.normal_(self.expert_up.weight, mean=0.0, std=std_up)
     
     def forward(self, hidden_states: torch.Tensor, used_token: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """MoE前向传播
