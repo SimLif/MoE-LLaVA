@@ -1602,7 +1602,7 @@ def train():
 
     if 'qwen2-vl' in model_args.model_name_or_path.lower():
         trainer = QwenMoETrainer(
-            processor=processor,
+            processing_class=processor,
             model=model,
             args=training_args,
             **data_module
@@ -1647,6 +1647,10 @@ def train():
             if training_args.local_rank == 0 or training_args.local_rank == -1:
                 [os.remove(i) for i in glob(os.path.join(training_args.output_dir, 'adapter_*'))]
     # print(model.state_dict().keys())
+
+    import torch.distributed as dist
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     train()
