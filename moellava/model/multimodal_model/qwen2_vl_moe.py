@@ -62,10 +62,8 @@ class CombinedLayer(nn.Module):
         # 处理MoE返回的(output, loss)元组
         if isinstance(moe_out, tuple) and len(moe_out) >= 2:
             return mlp_out + moe_out[0], moe_out[1]
-            # return moe_out[0], moe_out[1]
         else:
             return mlp_out + moe_out, None
-            # return moe_out, None
 
 
 try:
@@ -713,6 +711,7 @@ class EmbeddedMoELayer(nn.Module):
         dropout: float = 0.0,
         init_scale: float = 1.0,
         use_expert_gate: bool = False,
+        forward_mode: str = "batched",
         norm_type: str = "layernorm",
         use_norm: bool = False,
         use_pre_norm: bool = True,
@@ -752,6 +751,7 @@ class EmbeddedMoELayer(nn.Module):
             dropout=dropout,
             init_scale=init_scale,
             use_expert_gate=use_expert_gate,
+            forward_mode=forward_mode,
         )
     
     def forward(self, hidden_states: torch.Tensor, used_token: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -851,18 +851,18 @@ class DenseMaskMoE(nn.Module):
             raise ValueError(f"Unsupported activation: {activation}")
 
         # 用 nn.Embedding 存储下投影参数，每个专家的参数 shape: [hidden_size * expert_dim]
-        self.expert_down_emb = nn.Embedding(num_experts, hidden_size * expert_dim)
+        self.expert_down = nn.Embedding(num_experts, hidden_size * expert_dim)
         # 初始化并乘上合适的缩放因子
-        nn.init.normal_(self.expert_down_emb.weight, std=math.sqrt(2.0 / (hidden_size + expert_dim)))
+        nn.init.normal_(self.expert_down.weight, std=math.sqrt(2.0 / (hidden_size + expert_dim)))
         
         # 上投影参数，每个专家的参数 shape: [expert_dim * hidden_size]
-        self.expert_up_emb = nn.Embedding(num_experts, expert_dim * hidden_size)
-        nn.init.normal_(self.expert_up_emb.weight, std=math.sqrt(1.0 / hidden_size))
+        self.expert_up = nn.Embedding(num_experts, expert_dim * hidden_size)
+        nn.init.normal_(self.expert_up.weight, std=math.sqrt(1.0 / hidden_size))
         
         # 可选：专家内部门控参数，存储形状: [hidden_size * expert_dim]
         if self.use_expert_gate:
-            self.expert_gate_emb = nn.Embedding(num_experts, hidden_size * expert_dim)
-            nn.init.normal_(self.expert_gate_emb.weight, std=math.sqrt(2.0 / (hidden_size + expert_dim)))
+            self.expert_gate = nn.Embedding(num_experts, hidden_size * expert_dim)
+            nn.init.normal_(self.expert_gate.weight, std=math.sqrt(2.0 / (hidden_size + expert_dim)))
 
 
     def count_expert_cooccurrence(self, combine_dense: torch.Tensor) -> torch.Tensor:
@@ -948,7 +948,7 @@ class DenseMaskMoE(nn.Module):
 
         # 2. Fused 下投影：
         # 从 embedding 中恢复 expert_down_weight，形状为 [num_experts, hidden_size, expert_dim]
-        expert_down_weight = self.expert_down_emb.weight.view(self.num_experts, self.hidden_size, self.expert_dim)
+        expert_down_weight = self.expert_down.weight.view(self.num_experts, self.hidden_size, self.expert_dim)
         # 将 expert_down_weight 转置并融合为 [hidden_size, num_experts * expert_dim]
         fused_down = expert_down_weight.transpose(0, 1).reshape(self.hidden_size, self.num_experts * self.expert_dim)
         # 对输入 x 做一次 dense 运算，获得中间输出：[N, num_experts * expert_dim]
@@ -959,7 +959,7 @@ class DenseMaskMoE(nn.Module):
         # 3. 可选：专家内门控
         if self.use_expert_gate:
             # 从 embedding 中恢复 expert_gate_weight，形状为 [num_experts, hidden_size, expert_dim]
-            expert_gate_weight = self.expert_gate_emb.weight.view(self.num_experts, self.hidden_size, self.expert_dim)
+            expert_gate_weight = self.expert_gate.weight.view(self.num_experts, self.hidden_size, self.expert_dim)
             fused_gate = expert_gate_weight.transpose(0, 1).reshape(self.hidden_size, self.num_experts * self.expert_dim)
             gate_flat = x.matmul(fused_gate)
             gate_vals = gate_flat.view(N, self.num_experts, self.expert_dim)
@@ -969,7 +969,7 @@ class DenseMaskMoE(nn.Module):
 
         # 4. 上投影及加权求和：
         # 从 embedding 中恢复 expert_up_weight，形状为 [num_experts, expert_dim, hidden_size]
-        expert_up_weight = self.expert_up_emb.weight.view(self.num_experts, self.expert_dim, self.hidden_size)
+        expert_up_weight = self.expert_up.weight.view(self.num_experts, self.expert_dim, self.hidden_size)
         # 计算公式：
         #   output[n, h] = sum_{e, b} combine_dense[n, e] * intermediate_all[n, e, b] * expert_up_weight[e, b, h]
         output = torch.einsum('ne, neb, ebh -> nh', combine_dense, intermediate_all, expert_up_weight)
@@ -1443,6 +1443,7 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
             self.config.mone['mone_act_fn'] = model_args.mone_act_fn
             self.config.mone['mone_use_expert_gate'] = model_args.mone_use_expert_gate
             self.config.mone['mone_load_original'] = model_args.mone_load_original
+            self.config.mone['mone_forward_mode'] = model_args.mone_forward_mode
 
         self.config.moe['moe_enable'] = model_args.moe_enable
         self.config.moe['train_modules'] = model_args.train_modules
@@ -1552,6 +1553,7 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                         act_fn=self.config.mone['mone_act_fn'],          # 可选: "relu", "gelu", "silu", silu
                         dropout=self.config.mone['mone_dropout'],            # 专家dropout率
                         use_expert_gate=self.config.mone['mone_use_expert_gate'],  # 是否使用专家门控
+                        forward_mode=model_args.mone_forward_mode,  # 前向模式
                     )
                 elif model_args.mone_expert_type == 'dense_mask_expert':
                     moe_layer = DenseMaskMoE(
@@ -1567,7 +1569,7 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                 else:
                     raise NotImplementedError(f"Unsupported expert type: {model_args.mone_expert_type}")
 
-            if model_args.mone_load_original:
+            if getattr(model_args, 'mone_enable', False) and model_args.mone_load_original:
                 with torch.no_grad():
                     intermediate_size = original_mlp.gate_proj.weight.data.shape[0]
                     total_expert_dim = num_experts * expert_dim
@@ -1600,9 +1602,9 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                         moe_layer.moe.expert_down.weight.data.copy_(up_proj_weight_flat)
                         moe_layer.moe.expert_up.weight.data.copy_(down_proj_weight_flat)
                     elif model_args.mone_expert_type == 'dense_mask_expert':
-                        moe_layer.expert_gate_emb.weight.data.copy_(gate_proj_weight_flat)
-                        moe_layer.expert_down_emb.weight.data.copy_(up_proj_weight_flat)
-                        moe_layer.expert_up_emb.weight.data.copy_(down_proj_weight_flat)
+                        moe_layer.expert_gate.weight.data.copy_(gate_proj_weight_flat)
+                        moe_layer.expert_down.weight.data.copy_(up_proj_weight_flat)
+                        moe_layer.expert_up.weight.data.copy_(down_proj_weight_flat)
 
                     print(f'Successfully initialized weights for {num_experts} experts in layer {layer_num}')
             if model_args.use_shared_experts:
@@ -1700,7 +1702,7 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
                         use_query_bn=self.config.mone.get('mone_use_query_bn', False),   # 使用批量归一化提高稳定性
                         act_fn=self.config.mone.get('mone_act_fn', 'silu'),               # 可选: "relu", "gelu", "silu"
                         dropout=self.config.mone.get('mone_dropout', 0.0),             # 专家 dropout 率
-                        use_expert_gate=self.config.mone.get('use_expert_gate', False),    # 是否使用专家门控
+                        use_expert_gate=self.config.mone.get('mone_use_expert_gate', False),    # 是否使用专家门控
                     )
                 elif mone_expert_type == 'dense_mask_expert':
                     moe_layer = DenseMaskMoE(
@@ -1711,7 +1713,7 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
                         capacity_factor=self.config.moe.get('capacity_factor'),
                         eval_capacity_factor=self.config.moe.get('eval_capacity_factor'),
                         min_capacity=self.config.moe.get('min_capacity'),
-                        use_expert_gate=self.config.mone.get('use_expert_gate', False),
+                        use_expert_gate=self.config.mone.get('mone_use_expert_gate', False),
                     )
                 else:
                     raise NotImplementedError(f"Unsupported expert type: {mone_expert_type}")
