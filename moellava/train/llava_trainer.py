@@ -414,12 +414,19 @@ class QwenMoETrainer(Trainer):
                         "name": "no_decay_parameters"  # 确保每个组都有name
                     },
                 ]
-                
+
+            if self.args.freeze_original_mlp:
+                for group in optimizer_grouped_parameters:
+                    if group["name"] == "decay_no_special_parameters":
+                        group["params"] += [p for n, p in opt_model.named_parameters() if (n in decay_parameters) and ('original_mlp' in n)]
+                    elif group["name"] == "no_decay_no_special_parameters":
+                        group["params"] += [p for n, p in opt_model.named_parameters() if (n not in decay_parameters) and ('original_mlp' in n)]
+
             # 添加MoE支持
             if getattr(self.args, 'moe_enable', False):
                 from deepspeed.moe.utils import split_params_into_different_moe_groups_for_optimizer
                 optimizer_grouped_parameters = split_params_into_different_moe_groups_for_optimizer(optimizer_grouped_parameters)
-                
+            
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
 
             self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)

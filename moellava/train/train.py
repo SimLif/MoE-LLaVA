@@ -43,6 +43,7 @@ from moellava.mm_utils import tokenizer_image_token
 from moellava.model.language_model.llava_qwen_moe import EvalMoELLaVAQWenForCausalLM
 from moellava.train.utils import initialize_moe_with_pretrained_weights, make_supervised_data_module_qwen2_vl
 from moellava.train.args import ModelArguments, DataArguments, TrainingArguments
+from moellava.train.callbacks import EpochBasedUnfreezeCallback
 
 from PIL import Image
 from moellava.utils import order_pick_k
@@ -1570,6 +1571,13 @@ def train():
                 if hasattr(module, 'weight'):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
+    
+    if training_args.freeze_original_mlp:
+        for n, p in model.named_parameters():
+            if "original_mlp" in n:
+                p.requires_grad = False
+        rank0_print('--------------------- Freeze original_mlp parameters ---------------------')
+        
     for name, param in model.named_parameters():
         # param.requires_grad = True
         if param.requires_grad:
@@ -1606,6 +1614,9 @@ def train():
             model=model,
             args=training_args,
             **data_module
+        )
+        trainer.add_callback(
+            EpochBasedUnfreezeCallback(unfreeze_epoch=model_args.unfreeze_epoch)
         )
     else:
         trainer = LLaVATrainer(model=model,
