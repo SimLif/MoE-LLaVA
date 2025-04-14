@@ -322,10 +322,6 @@ class LLaVATrainer(Trainer):
 
 class QwenMoETrainer(Trainer):
 
-    def __init__(self, processor, *args, **kwargs):
-        super(QwenMoETrainer, self).__init__(*args, **kwargs)
-        self.processor = processor
-
     def create_optimizer(self):
         """
         Setup the optimizer with MoE support.
@@ -443,80 +439,8 @@ class QwenMoETrainer(Trainer):
         return self.optimizer
 
     def _save_checkpoint(self, model, trial, metrics=None):
-        if getattr(self.args, 'lora_enable', False):
-            from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
-            checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
-
-            run_dir = self._get_output_dir(trial=trial)
-            output_dir = os.path.join(run_dir, checkpoint_folder)
-
-            # 保存模型
-            self.save_model(output_dir, _internal_call=True)
-
-            # 保存非LoRA权重
-            non_lora_weights = get_peft_state_non_lora_maybe_zero_3(self.model.named_parameters(), require_grad_only=False)
-            torch.save(non_lora_weights, os.path.join(output_dir, "non_lora_state_dict.bin"))
-
-            if not getattr(self.args, 'save_only_model', False):
-                # Save optimizer and scheduler
-                self._save_optimizer_and_scheduler(output_dir)
-                # Save RNG state
-                self._save_rng_state(output_dir)
-
-            # Save the Trainer state
-            if self.args.should_save:
-                # Update the `TrainerControl` state to where we are currently
-                if hasattr(self.state, "stateful_callbacks") and "TrainerControl" in self.state.stateful_callbacks:
-                    self.state.stateful_callbacks["TrainerControl"] = self.control.state()
-                self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
-
-            if self.args.push_to_hub:
-                self._push_from_checkpoint(output_dir)
-
-            # Maybe delete some older checkpoints.
-            if self.args.should_save:
-                # Solely rely on numerical checkpoint id for rotation.
-                # mtime is not reliable especially on some fuse fs in cloud environments.
-                self._rotate_checkpoints(use_mtime=False, output_dir=run_dir)
-        else:
-            super(QwenMoETrainer, self)._save_checkpoint(model, trial)
+        super(QwenMoETrainer, self)._save_checkpoint(model, trial)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
-        # If we are executing this function, we are the process zero, so we don't check for that.
-        output_dir = output_dir if output_dir is not None else self.args.output_dir
-        os.makedirs(output_dir, exist_ok=True)
-        logger.info(f"Saving model checkpoint to {output_dir}")
-
-        supported_classes = (PreTrainedModel,) if not is_peft_available() else (PreTrainedModel, PeftModel)
-        # Save a trained model and configuration using `save_pretrained()`.
-        # They can then be reloaded using `from_pretrained()`
-        if not isinstance(self.model, supported_classes):
-            if state_dict is None:
-                state_dict = self.model.state_dict()
-
-            if isinstance(self.accelerator.unwrap_model(self.model), supported_classes):
-                self.accelerator.unwrap_model(self.model).save_pretrained(
-                    output_dir, state_dict=state_dict, safe_serialization=self.args.save_safetensors
-                )
-            else:
-                logger.info("Trainer.model is not a `PreTrainedModel`, only saving its state dict.")
-                if self.args.save_safetensors:
-                    safetensors.torch.save_file(
-                        state_dict, os.path.join(output_dir, SAFE_WEIGHTS_NAME), metadata={"format": "pt"}
-                    )
-                else:
-                    torch.save(state_dict, os.path.join(output_dir, WEIGHTS_NAME))
-        else:
-            self.model.save_pretrained(
-                output_dir, state_dict=state_dict, safe_serialization=self.args.save_safetensors
-            )
-
-        if self.tokenizer is not None:
-            self.tokenizer.save_pretrained(output_dir)
-
-        if self.processor is not None:
-            self.processor.save_pretrained(output_dir)
-
-        # Good practice: save your training arguments together with the trained model
-        torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
-        # super(QwenMoETrainer, self)._save(output_dir, state_dict)
+        self.processing_class.save_pretrained(output_dir)
+        super(QwenMoETrainer, self)._save(output_dir, state_dict)
