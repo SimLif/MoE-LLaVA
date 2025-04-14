@@ -1616,7 +1616,7 @@ def train():
             **data_module
         )
         trainer.add_callback(
-            EpochBasedUnfreezeCallback(unfreeze_epoch=model_args.unfreeze_epoch)
+            EpochBasedUnfreezeCallback(unfreeze_original_mlp_epoch=model_args.unfreeze_original_mlp_epoch)
         )
     else:
         trainer = LLaVATrainer(model=model,
