@@ -1606,7 +1606,7 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                         moe_layer.expert_down.weight.data.copy_(up_proj_weight_flat)
                         moe_layer.expert_up.weight.data.copy_(down_proj_weight_flat)
 
-                    print(f'Successfully initialized weights for {num_experts} experts in layer {layer_num}')
+                    rank0_print(f'Successfully initialized weights for {num_experts} experts in layer {layer_num}')
             if model_args.use_shared_experts:
                 moe_layer = CombinedLayer(self.model.layers[layer_num].mlp, moe_layer)
             self.model.layers[layer_num].mlp = moe_layer
@@ -1744,6 +1744,7 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
         
         self.model.forward = MoEQwen2VLModel_forward(self.model)
         rank0_print(f'replace Qwen2VLModel.forward to MoEQwen2VLModel.forward')
+        rank0_print(self.model)
     
     get_rope_index = Qwen2VLForConditionalGeneration.get_rope_index
     prepare_inputs_for_generation = Qwen2VLForConditionalGeneration.prepare_inputs_for_generation
