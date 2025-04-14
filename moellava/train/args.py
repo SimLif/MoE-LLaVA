@@ -117,3 +117,4 @@ class TrainingArguments(transformers.TrainingArguments):
     group_by_modality_length: bool = field(default=False)
     vision_lr: Optional[float] = None
     merger_lr: Optional[float] = None
+    freeze_original_mlp: bool = False
