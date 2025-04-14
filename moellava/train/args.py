@@ -62,6 +62,7 @@ class ModelArguments:
     mone_use_expert_gate: bool = False
     mone_load_original: bool = False
     mone_forward_mode: str = "batched"
+    unfreeze_epoch: int = 1
 
 @dataclass
 class DataArguments:
