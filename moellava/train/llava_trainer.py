@@ -23,7 +23,8 @@ from typing import List, Optional
 import safetensors
 from peft import PeftModel
 from transformers.modeling_utils import PreTrainedModel
-
+from transformers.trainer import _is_peft_model
+from transformers.trainer import *
 
 def maybe_zero_3(param, ignore_status=False, name=None):
     from deepspeed import zero
