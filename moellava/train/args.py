@@ -50,6 +50,7 @@ class ModelArguments:
     ffn_only: bool = False
     load_k_experts: bool = False
     k_experts_path: Optional[str] = None
+    use_shared_experts: bool = False
     mone_enable: bool = False
     mone_r: int = 128
     mone_dropout: float = 0.00
@@ -60,6 +61,7 @@ class ModelArguments:
     mone_act_fn: str = "silu"
     mone_use_expert_gate: bool = False
     mone_load_original: bool = False
+    mone_forward_mode: str = "batched"
 
 @dataclass
 class DataArguments:

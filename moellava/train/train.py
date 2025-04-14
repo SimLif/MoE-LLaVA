@@ -1411,7 +1411,7 @@ def train():
             )
             model = initialize_moe_with_pretrained_weights(model, model_k, model.config.moe['moe_layers_idx'], 'moe-qwen2-vl')
         del model_k
-    return
+    # return
 
     if 'mpt' in model_args.model_name_or_path:
         tokenizer = transformers.AutoTokenizer.from_pretrained(
