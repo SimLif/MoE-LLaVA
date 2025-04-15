@@ -1603,13 +1603,13 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                         gate_proj_weight = original_mlp.gate_proj.weight.data # (intermediate_size, hidden_size)
                         if m > 1:
                             gate_proj_weight = gate_proj_weight.repeat(m, 1) # (m * intermediate_size, hidden_size)
-                        gate_proj_weight_reshaped = gate_proj_weight.view(num_experts, expert_dim, hidden_size)
+                        gate_proj_weight_reshaped = gate_proj_weight.view(num_experts, expert_dim, hidden_size).transpose(1, 2)
                         gate_proj_weight_flat = gate_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
                     
                     up_proj_weight = original_mlp.up_proj.weight.data
                     if m > 1:
                         up_proj_weight = up_proj_weight.repeat(m, 1)
-                    up_proj_weight_reshaped = up_proj_weight.view(num_experts, expert_dim, hidden_size)
+                    up_proj_weight_reshaped = up_proj_weight.view(num_experts, expert_dim, hidden_size).transpose(1, 2)
                     up_proj_weight_flat = up_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
                     
                     down_proj_weight = original_mlp.down_proj.weight.data.t()
