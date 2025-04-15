@@ -1412,6 +1412,13 @@ def train():
             )
             model = initialize_moe_with_pretrained_weights(model, model_k, model.config.moe['moe_layers_idx'], 'moe-qwen2-vl')
         del model_k
+    
+    if model_args.from_pretrained:
+        state_dict = torch.load(model_args.from_pretrained_path, map_location="cpu")
+        incompatible = model.load_state_dict(state_dict, strict=False)
+        print("Missing keys:", incompatible.missing_keys)
+        print("Unexpected keys:", incompatible.unexpected_keys)
+        rank0_print(f'------------------------------- load from {model_args.from_pretrained_path} -------------------------------')
     # return
 
     if 'mpt' in model_args.model_name_or_path:
@@ -1615,9 +1622,10 @@ def train():
             args=training_args,
             **data_module
         )
-        trainer.add_callback(
-            EpochBasedUnfreezeCallback(unfreeze_original_mlp_epoch=model_args.unfreeze_original_mlp_epoch)
-        )
+        if training_args.freeze_original_mlp:
+            trainer.add_callback(
+                EpochBasedUnfreezeCallback(unfreeze_original_mlp_epoch=model_args.unfreeze_original_mlp_epoch)
+            )
     else:
         trainer = LLaVATrainer(model=model,
                         tokenizer=tokenizer,

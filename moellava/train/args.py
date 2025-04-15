@@ -63,6 +63,9 @@ class ModelArguments:
     mone_load_original: bool = False
     mone_forward_mode: str = "batched"
     unfreeze_original_mlp_epoch: int = 1
+    use_combined_gate: bool = False
+    from_pretrained: bool = False
+    from_pretrained_path: str = ""
 
 @dataclass
 class DataArguments:
