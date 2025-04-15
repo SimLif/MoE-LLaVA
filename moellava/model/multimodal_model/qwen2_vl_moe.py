@@ -51,19 +51,37 @@ class SmallExpert(nn.Module):
 
 # 定义组合层，结合原始MLP和MoE
 class CombinedLayer(nn.Module):
-    def __init__(self, original_mlp, moe_layer):
+    def __init__(self, original_mlp, moe_layer, use_gate=False, hidden_size=0):
         super().__init__()
         self.original_mlp = original_mlp
         self.moe_layer = moe_layer
+        self.use_gate = use_gate
+        if use_gate:
+            self.gate = nn.Linear(hidden_size, 2, bias=False)
         
     def forward(self, x):
         mlp_out = self.original_mlp(x)
         moe_out = self.moe_layer(x)
+        
         # 处理MoE返回的(output, loss)元组
         if isinstance(moe_out, tuple) and len(moe_out) >= 2:
-            return mlp_out + moe_out[0], moe_out[1]
+            moe_out, aux_loss = moe_out[0], moe_out[1]
         else:
-            return mlp_out + moe_out, None
+            moe_out, aux_loss = moe_out, None
+        
+        if self.use_gate:
+            x_fp32 = x.float()
+            gating_scores = torch.nn.functional.linear(x_fp32, weight=self.gate.weight.float(), bias=None)
+            weights = F.softmax(gating_scores, dim=-1).to(x.dtype)
+
+            mlp_weight = weights[..., 0].unsqueeze(-1)
+            moe_weight = weights[..., 1].unsqueeze(-1)
+
+            moe_out = mlp_weight * mlp_out + moe_weight * moe_out
+        else:
+            moe_out = mlp_out + moe_out
+        return moe_out, aux_loss
+
 
 
 try:
@@ -1457,6 +1475,7 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
         self.config.moe['use_residual'] = model_args.use_residual
         self.config.moe['router_aux_loss_coef'] = self.router_aux_loss_coef = model_args.router_aux_loss_coef
         self.config.moe['use_shared_experts'] = model_args.use_shared_experts
+        self.config.moe['use_combined_gate'] = model_args.use_combined_gate
         
         # Freeze all parameters except those specified in train_modules
         if self.config.moe['train_modules'] is not None and len(self.config.moe['train_modules']) > 0:
@@ -1586,11 +1605,13 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                             gate_proj_weight = gate_proj_weight.repeat(m, 1) # (m * intermediate_size, hidden_size)
                         gate_proj_weight_reshaped = gate_proj_weight.view(num_experts, expert_dim, hidden_size)
                         gate_proj_weight_flat = gate_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
+                    
                     up_proj_weight = original_mlp.up_proj.weight.data
                     if m > 1:
                         up_proj_weight = up_proj_weight.repeat(m, 1)
                     up_proj_weight_reshaped = up_proj_weight.view(num_experts, expert_dim, hidden_size)
                     up_proj_weight_flat = up_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
+                    
                     down_proj_weight = original_mlp.down_proj.weight.data.t()
                     if m > 1:
                         down_proj_weight = down_proj_weight.repeat(m, 1)
@@ -1606,9 +1627,9 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                         moe_layer.expert_down.weight.data.copy_(up_proj_weight_flat)
                         moe_layer.expert_up.weight.data.copy_(down_proj_weight_flat)
 
-                    rank0_print(f'Successfully initialized weights for {num_experts} experts in layer {layer_num}')
+                    print(f'Successfully initialized weights for {num_experts} experts in layer {layer_num}')
             if model_args.use_shared_experts:
-                moe_layer = CombinedLayer(self.model.layers[layer_num].mlp, moe_layer)
+                moe_layer = CombinedLayer(self.model.layers[layer_num].mlp, moe_layer, self.config.moe['use_combined_gate'], self.config.hidden_size)
             self.model.layers[layer_num].mlp = moe_layer
 
         # # 冻结普通MLP层，只训练MoE层
@@ -1621,7 +1642,7 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
         #         param.requires_grad = False  # 如果只想训练MoE部分
         
         
-        rank0_print(f"LLM num_layers: {num_layers}, MoE num_layers: {len(moe_layers_idx)}, where\n",
+        print(f"LLM num_layers: {num_layers}, MoE num_layers: {len(moe_layers_idx)}, where\n",
                     *[f'layer-{layer_num} has {num_experts} experts\n' for num_experts, layer_num in
                       zip(self.config.moe['num_experts'], moe_layers_idx)])
 
@@ -1730,7 +1751,7 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
                     use_residual=self.config.moe.get('use_residual'),
                 )
             if self.config.moe.get('use_shared_experts', False):
-                moe_layer = CombinedLayer(original_mlp, moe_layer)
+                moe_layer = CombinedLayer(original_mlp, moe_layer, self.config.moe.get('use_combined_gate', False), self.config.hidden_size)
             self.model.layers[layer_num].mlp = moe_layer
 
         rank0_print(f"LLM num_layers: {num_layers}, MoE num_layers: {len(moe_layers_idx)}, where\n",
