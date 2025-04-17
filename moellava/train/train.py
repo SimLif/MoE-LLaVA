@@ -1410,7 +1410,10 @@ def train():
                 cache_dir=training_args.cache_dir,
                 **bnb_model_from_pretrained_args
             )
-            model = initialize_moe_with_pretrained_weights(model, model_k, model.config.moe['moe_layers_idx'], 'moe-qwen2-vl')
+            model_type = 'moe-qwen2-vl'
+            if model_args.mone_expert_type == 'dense_mask_expert':
+                model_type += '-ds'
+            model = initialize_moe_with_pretrained_weights(model, model_k, model.config.moe['moe_layers_idx'], model_type)
         del model_k
     
     if model_args.from_pretrained:
