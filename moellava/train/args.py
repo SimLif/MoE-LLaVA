@@ -66,6 +66,7 @@ class ModelArguments:
     use_combined_gate: bool = False
     from_pretrained: bool = False
     from_pretrained_path: str = ""
+    warm_up_experts: bool = False
 
 @dataclass
 class DataArguments:
