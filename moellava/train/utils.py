@@ -68,8 +68,8 @@ def initialize_moe_with_pretrained_weights(model_new, model_pretrained, layer_in
         },
         'moe-qwen2-vl-ds': {
             'target_param_names': [
-                "model.layers.{i}.mlp.expert_down.weight",
-                "model.layers.{i}.mlp.expert_up.weight",
+                "model.layers.{i}.mlp.moe_layer.expert_down.weight",
+                "model.layers.{i}.mlp.moe_layer.expert_up.weight",
             ],
             'source_param_names': [
                 "model.layers.{i}.mlp.expert_down.weight",
