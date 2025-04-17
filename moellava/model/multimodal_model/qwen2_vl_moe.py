@@ -1754,18 +1754,18 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
                 moe_layer = CombinedLayer(original_mlp, moe_layer, self.config.moe.get('use_combined_gate', False), self.config.hidden_size)
             self.model.layers[layer_num].mlp = moe_layer
 
-        rank0_print(f"LLM num_layers: {num_layers}, MoE num_layers: {len(moe_layers_idx)}, where\n",
+        print(f"LLM num_layers: {num_layers}, MoE num_layers: {len(moe_layers_idx)}, where\n",
                     *[f'layer-{layer_num} has {num_experts} experts\n' for num_experts, layer_num in
                       zip(self.config.moe['num_experts'], moe_layers_idx)])
 
         # Replace forward methods for evaluation
         for m in self.model.layers:
             m.forward = MoEQwen2DecoderLayer_forward(m)
-        rank0_print(f'replace Qwen2DecoderLayer.forward to MoEQwen2DecoderLayer.forward')
+        print(f'replace Qwen2DecoderLayer.forward to MoEQwen2DecoderLayer.forward')
         
         self.model.forward = MoEQwen2VLModel_forward(self.model)
-        rank0_print(f'replace Qwen2VLModel.forward to MoEQwen2VLModel.forward')
-        rank0_print(self.model)
+        print(f'replace Qwen2VLModel.forward to MoEQwen2VLModel.forward')
+        print(self.model)
     
     get_rope_index = Qwen2VLForConditionalGeneration.get_rope_index
     prepare_inputs_for_generation = Qwen2VLForConditionalGeneration.prepare_inputs_for_generation
