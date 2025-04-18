@@ -452,6 +452,70 @@ class SimilarityGate(nn.Module):
         return l_aux, combine_weights, dispatch_mask, exp_counts, flat_expert_indices
 
 
+class DenseGate(nn.Module):
+    def __init__(self,
+                 model_dim: int,
+                 num_experts: int,) -> None:
+        super().__init__()
+        self.wg = nn.Linear(model_dim, num_experts, bias=False)
+    
+    def compute_entropy(self, p):
+        """
+        计算给定概率分布 p 的熵。
+        参数：
+        p (torch.Tensor): 一维概率分布张量，所有元素之和应为1。
+        返回：
+        torch.Tensor: 分布 p 的熵。
+        """
+        # 避免 log(0) 的问题，将 0 限制为一个很小的正数
+        p = torch.clamp(p, min=1e-12, max=1.0)
+
+        return -torch.sum(p * torch.log(p))
+
+    def mutual_information_loss(self, gates):
+        """
+        计算专家路由中的互信息损失，用于鼓励专家之间均衡使用。
+        互信息损失定义为：
+        Loss = H(平均路由概率) - 平均(每个样本的路由概率熵)
+        参数：
+        gates (torch.Tensor): 形状为 (batch_size, num_experts) 的张量，
+        每一行为一个样本对各个专家的路由概率分布。
+        返回：
+        torch.Tensor: 互信息损失的值。
+        """
+        # 计算所有样本的平均路由概率（专家重要性分布）
+        avg_gate = torch.mean(gates, dim=0)
+        # 计算重要性分布的熵
+        entropy_avg = self.compute_entropy(avg_gate)
+        # 计算每个样本的路由概率熵（逐行计算），然后取均值
+        # 这里对 gates 每个元素同样进行 clip 防止 log(0)
+        entropy_per_sample = -torch.sum(gates * torch.log(torch.clamp(gates, min=1e-12, max=1.0)), dim=1)
+        avg_entropy = torch.mean(entropy_per_sample)
+        # 互信息损失
+        loss = entropy_avg - avg_entropy
+
+        return loss
+
+    def forward(self, input: torch.Tensor,) -> Tuple[Tensor, Tensor, Tensor]:
+        """
+        前向传播函数，计算专家路由概率和互信息损失。
+        参数：
+        input (torch.Tensor): 输入张量，形状为 (batch_size*seq_len, model_dim)。
+        返回：
+        Tuple[Tensor, Tensor, Tensor]: 返回三个张量：
+            - l_aux: 互信息损失值。
+            - combine_weights: 专家路由概率，形状为 (batch_size*seq_len, num_experts)。
+        """
+
+        input_fp32 = input.float()
+        logits = torch.nn.functional.linear(input_fp32, weight=self.wg.weight.float(), bias=None)
+        combine_weights = gates = F.softmax(logits, dim=1)
+
+        l_aux = self.mutual_information_loss(gates)
+
+        return l_aux, combine_weights, None, None
+
+
 class EmbeddedExpertsMoE(nn.Module):
     """
     基于嵌入式存储的大规模MoE实现
@@ -823,7 +887,8 @@ class DenseMaskMoE(nn.Module):
         min_capacity: int = 8,
         dropout: float = 0.0,
         activation: str = "silu",
-        use_expert_gate: bool = False
+        use_expert_gate: bool = False,
+        gate_type: str = "token_gating",
     ):
         """
         Args:
@@ -844,17 +909,26 @@ class DenseMaskMoE(nn.Module):
         self.num_experts = num_experts
         self.k = k
         self.use_expert_gate = use_expert_gate
+        self.gate_type = gate_type
 
         # 使用 deepspeed 的 TopKGate 进行专家路由
-        self.gate = TopKGate(
-            model_dim=hidden_size,
-            num_experts=num_experts,
-            k=k,
-            capacity_factor=capacity_factor,
-            eval_capacity_factor=eval_capacity_factor,
-            min_capacity=min_capacity,
-            drop_tokens=True,
-        )
+        if gate_type == 'token_gating':
+            self.gate = TopKGate(
+                model_dim=hidden_size,
+                num_experts=num_experts,
+                k=k,
+                capacity_factor=capacity_factor,
+                eval_capacity_factor=eval_capacity_factor,
+                min_capacity=min_capacity,
+                drop_tokens=True,
+            )
+        elif gate_type == 'dense_gating':
+            self.gate = DenseGate(
+                model_dim=hidden_size,
+                num_experts=num_experts,
+            )
+        else:
+            raise ValueError(f"Unsupported gate type: {gate_type}")
 
         self.dropout = nn.Dropout(dropout)
         
@@ -1584,6 +1658,7 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                         eval_capacity_factor=model_args.eval_capacity_factor,
                         min_capacity=model_args.min_capacity,
                         use_expert_gate=model_args.mone_use_expert_gate,
+                        gate_type=model_args.mone_gate_type,
                     )
                 else:
                     raise NotImplementedError(f"Unsupported expert type: {model_args.mone_expert_type}")
@@ -1735,6 +1810,7 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
                         eval_capacity_factor=self.config.moe.get('eval_capacity_factor'),
                         min_capacity=self.config.moe.get('min_capacity'),
                         use_expert_gate=self.config.mone.get('mone_use_expert_gate', False),
+                        gate_type=self.config.mone.get('mone_gate_type', 'token_gating'),
                     )
                 else:
                     raise NotImplementedError(f"Unsupported expert type: {mone_expert_type}")
