@@ -342,6 +342,7 @@ class QwenMoETrainer(Trainer):
             lr_mapper = {}
             visual_parameters = []
             merger_parameters = []
+            shared_parameters = []
 
             if self.args.vision_lr is not None:
                 lr_mapper["visual"] = self.args.vision_lr
@@ -349,9 +350,12 @@ class QwenMoETrainer(Trainer):
             if self.args.merger_lr is not None:
                 lr_mapper["merger"] = self.args.merger_lr
                 merger_parameters = [name for name, _ in opt_model.named_parameters() if "merger" in name]
+            if self.args.shared_lr is not None:
+                lr_mapper["shared"] = self.args.shared_lr
+                shared_parameters = [name for name, _ in opt_model.named_parameters() if "shared" in name]
 
             if len(lr_mapper) > 0:
-                special_lr_parameters = merger_parameters + visual_parameters
+                special_lr_parameters = merger_parameters + visual_parameters + shared_parameters
                 
                 optimizer_grouped_parameters = [
                     {
@@ -398,6 +402,23 @@ class QwenMoETrainer(Trainer):
                                 "weight_decay": 0.0,
                                 "lr": self.args.merger_lr,
                                 "name": "no_decay_merger_parameters"  # 确保每个组都有name
+                            },
+                        ]
+                    )
+                if shared_parameters:
+                    optimizer_grouped_parameters.extend(
+                        [
+                            {
+                                "params": [p for n, p in opt_model.named_parameters() if (n in decay_parameters and n in shared_parameters and p.requires_grad)],
+                                "weight_decay": self.args.weight_decay,
+                                "lr": self.args.shared_lr,
+                                "name": "decay_shared_parameters"  # 确保每个组都有name
+                            },
+                            {
+                                "params": [p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n in shared_parameters and p.requires_grad)],
+                                "weight_decay": 0.0,
+                                "lr": self.args.shared_lr,
+                                "name": "no_decay_shared_parameters"  # 确保每个组都有name
                             },
                         ]
                     )
