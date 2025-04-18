@@ -436,12 +436,12 @@ class QwenMoETrainer(Trainer):
                     },
                 ]
 
-            if self.args.freeze_original_mlp:
+            if self.args.freeze_shared:
                 for group in optimizer_grouped_parameters:
                     if group["name"] == "decay_no_special_parameters":
-                        group["params"] += [p for n, p in opt_model.named_parameters() if (n in decay_parameters) and ('original_mlp' in n)]
+                        group["params"] += [p for n, p in opt_model.named_parameters() if (n in decay_parameters) and ('shared' in n)]
                     elif group["name"] == "no_decay_no_special_parameters":
-                        group["params"] += [p for n, p in opt_model.named_parameters() if (n not in decay_parameters) and ('original_mlp' in n)]
+                        group["params"] += [p for n, p in opt_model.named_parameters() if (n not in decay_parameters) and ('shared' in n)]
 
             # 添加MoE支持
             if getattr(self.args, 'moe_enable', False):
