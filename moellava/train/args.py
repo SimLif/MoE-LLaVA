@@ -122,3 +122,4 @@ class TrainingArguments(transformers.TrainingArguments):
     vision_lr: Optional[float] = None
     merger_lr: Optional[float] = None
     freeze_shared: bool = False
+    shared_lr: Optional[float] = None
