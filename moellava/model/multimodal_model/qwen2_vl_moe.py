@@ -51,17 +51,17 @@ class SmallExpert(nn.Module):
 
 # 定义组合层，结合原始MLP和MoE
 class CombinedLayer(nn.Module):
-    def __init__(self, original_mlp, moe_layer, use_gate=False, hidden_size=0):
+    def __init__(self, shared, moe, use_gate=False, hidden_size=0):
         super().__init__()
-        self.original_mlp = original_mlp
-        self.moe_layer = moe_layer
+        self.shared = shared
+        self.moe = moe
         self.use_gate = use_gate
         if use_gate:
             self.gate = nn.Linear(hidden_size, 2, bias=False)
         
     def forward(self, x):
-        mlp_out = self.original_mlp(x)
-        moe_out = self.moe_layer(x)
+        mlp_out = self.shared(x)
+        moe_out = self.moe(x)
         
         # 处理MoE返回的(output, loss)元组
         if isinstance(moe_out, tuple) and len(moe_out) >= 2:

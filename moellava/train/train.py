@@ -1589,11 +1589,11 @@ def train():
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
     
-    if training_args.freeze_original_mlp:
+    if training_args.freeze_shared:
         for n, p in model.named_parameters():
-            if "original_mlp" in n:
+            if "shared" in n:
                 p.requires_grad = False
-        rank0_print('--------------------- Freeze original_mlp parameters ---------------------')
+        rank0_print('--------------------- Freeze shared parameters ---------------------')
         
     for name, param in model.named_parameters():
         # param.requires_grad = True
@@ -1632,9 +1632,9 @@ def train():
             args=training_args,
             **data_module
         )
-        if training_args.freeze_original_mlp:
+        if training_args.freeze_shared:
             trainer.add_callback(
-                EpochBasedUnfreezeCallback(unfreeze_original_mlp_epoch=model_args.unfreeze_original_mlp_epoch)
+                EpochBasedUnfreezeCallback(unfreeze_shared_epoch=model_args.unfreeze_shared_epoch)
             )
     else:
         trainer = LLaVATrainer(model=model,

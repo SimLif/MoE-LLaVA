@@ -62,7 +62,7 @@ class ModelArguments:
     mone_use_expert_gate: bool = False
     mone_load_original: bool = False
     mone_forward_mode: str = "batched"
-    unfreeze_original_mlp_epoch: int = 1
+    unfreeze_shared_epoch: int = 1
     use_combined_gate: bool = False
     from_pretrained: bool = False
     from_pretrained_path: str = ""
@@ -121,4 +121,4 @@ class TrainingArguments(transformers.TrainingArguments):
     group_by_modality_length: bool = field(default=False)
     vision_lr: Optional[float] = None
     merger_lr: Optional[float] = None
-    freeze_original_mlp: bool = False
+    freeze_shared: bool = False
