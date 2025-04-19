@@ -1035,10 +1035,11 @@ class DenseMaskMoE(nn.Module):
         if self.gate_type == "token_gating":
             l_aux, combine_weights, dispatch_mask, exp_counts = self.gate(x)
             # 将 combine_weights 在 capacity 维度上求和，形状：[N, num_experts]
+            combine_weights = combine_weights.to(x.dtype)
             combine_dense = combine_weights.sum(dim=-1)
         elif self.gate_type == "dense_gating":
             l_aux, combine_dense, _, exp_counts = self.gate(x)
-        combine_dense = combine_dense.to(x.dtype)
+            combine_dense = combine_dense.to(x.dtype)
 
         # 2. Fused 下投影：
         # 从 embedding 中恢复 expert_down_weight，形状为 [num_experts, hidden_size, expert_dim]
