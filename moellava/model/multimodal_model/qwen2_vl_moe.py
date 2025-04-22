@@ -1913,7 +1913,14 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
                     use_residual=self.config.moe.get('use_residual'),
                 )
             if self.config.moe.get('use_shared_experts', False):
-                moe_layer = CombinedLayer(original_mlp, moe_layer, self.config.moe.get('use_combined_gate', False), self.config.hidden_size)
+                moe_layer = CombinedLayer(
+                    original_mlp, 
+                    moe_layer, 
+                    self.config.moe.get('use_combined_gate', False),
+                    self.config.moe.get('combined_gate_type', False),
+                    self.config.moe.get('combined_gate_drop', False),
+                    self.config.hidden_size
+                )
             self.model.layers[layer_num].mlp = moe_layer
 
         print(f"LLM num_layers: {num_layers}, MoE num_layers: {len(moe_layers_idx)}, where\n",
