@@ -64,6 +64,8 @@ class ModelArguments:
     mone_forward_mode: str = "batched"
     unfreeze_shared_epoch: int = 1
     use_combined_gate: bool = False
+    combined_gate_type: str = 'ds'
+    combined_gate_drop: float = 0.002
     from_pretrained: bool = False
     from_pretrained_path: str = ""
     warm_up_experts: bool = False

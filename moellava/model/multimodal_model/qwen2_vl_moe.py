@@ -51,37 +51,104 @@ class SmallExpert(nn.Module):
 
 # 定义组合层，结合原始MLP和MoE
 class CombinedLayer(nn.Module):
-    def __init__(self, shared, moe, use_gate=False, hidden_size=0):
+    def __init__(self, shared, moe, use_gate=False, gate_type='ds',
+                 gate_dropout=0.0, hidden_size=0, cmr_target=0.8):
+        """
+        Args:
+            shared: 共享的 MLP（或 FFN）模块
+            moe: MoE 层模块，注意其 forward 返回值可能是 (output, aux_loss) 的元组
+            use_gate: 是否使用 Gate 来动态路由流经哪条分支
+            gate_type: Gate 类型，'ds' 表示双分支（dense & MoE）使用 softmax 得到两个权重，
+                       'cmr' 表示使用单分支 gate，且会计算额外辅助损失（路由预算约束）
+            gate_dropout: 在 `cmr` 模型中，训练时随机将一部分 gate 输出置 0 的概率，
+                          用以强制部分 tokens 仅走共享分支
+            hidden_size: 输入的隐藏层尺寸，用于构造 gate 层
+            cmr_target: 对于 cmr gate，预算约束的目标概率值 (例如 0.8 表示希望 MoE 分支占 80%)
+        """
         super().__init__()
         self.shared = shared
         self.moe = moe
         self.use_gate = use_gate
-        if use_gate:
-            self.gate = nn.Linear(hidden_size, 2, bias=False)
+        self.gate_type = gate_type
+        self.gate_dropout = gate_dropout
+        self.cmr_target = cmr_target
         
+        if use_gate:
+            if self.gate_type == 'ds':
+                # 输出2个logits，分别对应共享分支（FFNshared）和MoE分支
+                self.gate = nn.Linear(hidden_size, 2, bias=False)
+            elif self.gate_type == 'cmr':
+                # 输出1个logit，之后经 sigmoid 映射到 (0,1) 得到 MoE 分支权重
+                self.gate = nn.Linear(hidden_size, 1, bias=False)
+            else:
+                raise NotImplementedError(f"Gate type {self.gate_type} not implemented")
+    
     def forward(self, x):
+        """
+        Args:
+            x: 输入张量，形状：[batch_size, ..., hidden_size]
+        Returns:
+            combined_out: 组合后的输出
+            aux_loss_total: 如存在辅助损失，则返回。否则为 None
+        """
+        # 先分别计算共享层和 MoE 层的输出
         mlp_out = self.shared(x)
         moe_out = self.moe(x)
         
-        # 处理MoE返回的(output, loss)元组
+        # 处理 MoE 层可能返回 (output, aux_loss) 的情况
         if isinstance(moe_out, tuple) and len(moe_out) >= 2:
-            moe_out, aux_loss = moe_out[0], moe_out[1]
+            base_moe_out, moe_aux_loss = moe_out[0], moe_out[1]
         else:
-            moe_out, aux_loss = moe_out, None
+            base_moe_out, moe_aux_loss = moe_out, None
         
         if self.use_gate:
+            # 为了数值稳定性，先转换为 fp32 再送入 gate 层
             x_fp32 = x.float()
-            gating_scores = torch.nn.functional.linear(x_fp32, weight=self.gate.weight.float(), bias=None)
-            weights = F.softmax(gating_scores, dim=-1).to(x.dtype)
-
-            mlp_weight = weights[..., 0].unsqueeze(-1)
-            moe_weight = weights[..., 1].unsqueeze(-1)
-
-            moe_out = mlp_weight * mlp_out + moe_weight * moe_out
+            
+            if self.gate_type == 'ds':
+                # 计算两个分支的 logits，并通过 softmax 得到权重
+                gating_scores = torch.nn.functional.linear(x_fp32, weight=self.gate.weight.float(), bias=None)
+                weights = F.softmax(gating_scores, dim=-1).to(x.dtype)
+                
+                # 第一个分量对应共享分支，第二个分量对应 MoE 层
+                mlp_weight = weights[..., 0].unsqueeze(-1)
+                moe_weight = weights[..., 1].unsqueeze(-1)
+                
+                combined_out = mlp_weight * mlp_out + moe_weight * base_moe_out
+                aux_loss_gate = None
+            
+            elif self.gate_type == 'cmr':
+                # 计算 gate 输出概率
+                gating_scores = torch.nn.functional.linear(x_fp32, weight=self.gate.weight.float(), bias=None)
+                gate_prob = torch.sigmoid(gating_scores).to(x.dtype)  # MoE 分支的选择概率
+                
+                # 如果在训练阶段，随机将一部分 tokens 的 gate 置 0，即强制这些 tokens 只走共享分支
+                if self.training and self.gate_dropout > 0:
+                    drop_mask = (torch.rand_like(gate_prob) < self.gate_dropout).to(x.dtype)
+                    gate_prob = gate_prob * (1.0 - drop_mask)
+                
+                # 共享分支的权重为 (1 - gate_prob)
+                mlp_weight = 1.0 - gate_prob
+                combined_out = mlp_weight * mlp_out + gate_prob * base_moe_out
+                
+                # 计算门控辅助损失：鼓励 gate_prob 接近 cmr_target
+                aux_loss_gate = torch.mean(torch.abs(gate_prob - self.cmr_target))
+            else:
+                raise NotImplementedError(f"Gate type {self.gate_type} not implemented")
+            
+            # 如果 MoE 层也返回了辅助损失，则将两部分加和
+            if moe_aux_loss is not None and aux_loss_gate is not None:
+                aux_loss_total = moe_aux_loss + aux_loss_gate
+            elif moe_aux_loss is not None:
+                aux_loss_total = moe_aux_loss
+            else:
+                aux_loss_total = aux_loss_gate
         else:
-            moe_out = mlp_out + moe_out
-        return moe_out, aux_loss
-
+            # 若不使用 gate，则简单求和（或者你也可以用其他融合方式）
+            combined_out = mlp_out + base_moe_out
+            aux_loss_total = moe_aux_loss
+        
+        return combined_out, aux_loss_total
 
 
 try:
@@ -1553,6 +1620,8 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
         self.config.moe['router_aux_loss_coef'] = self.router_aux_loss_coef = model_args.router_aux_loss_coef
         self.config.moe['use_shared_experts'] = model_args.use_shared_experts
         self.config.moe['use_combined_gate'] = model_args.use_combined_gate
+        self.config.moe['combined_gate_type'] = model_args.combined_gate_type
+        self.config.moe['combined_gate_drop'] = model_args.combined_gate_drop
         
         # Freeze all parameters except those specified in train_modules
         if self.config.moe['train_modules'] is not None and len(self.config.moe['train_modules']) > 0:
@@ -1714,7 +1783,14 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
 
                     print(f'Successfully initialized weights for {num_experts} experts in layer {layer_num}')
             if model_args.use_shared_experts:
-                moe_layer = CombinedLayer(self.model.layers[layer_num].mlp, moe_layer, self.config.moe['use_combined_gate'], self.config.hidden_size)
+                moe_layer = CombinedLayer(
+                    self.model.layers[layer_num].mlp, 
+                    moe_layer, 
+                    self.config.moe['use_combined_gate'], 
+                    self.config.moe['combined_gate_type'],
+                    self.config.moe['combined_gate_drop'],
+                    self.config.hidden_size
+                )
             self.model.layers[layer_num].mlp = moe_layer
 
         # # 冻结普通MLP层，只训练MoE层
