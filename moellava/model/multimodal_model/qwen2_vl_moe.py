@@ -1670,29 +1670,36 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                 with torch.no_grad():
                     intermediate_size = original_mlp.gate_proj.weight.data.shape[0]
                     total_expert_dim = num_experts * expert_dim
+
+                    # 计算复制因子，向上取整
                     if total_expert_dim % intermediate_size != 0:
-                        raise ValueError(
-                            f"无法进行扩展初始化，因为 num_experts * expert_dim ({total_expert_dim}) "
+                        print(
+                            f"num_experts * expert_dim ({total_expert_dim}) "
                             f"不能整除 intermediate_size ({intermediate_size})"
                         )
-                    m = total_expert_dim // intermediate_size  # 复制因子
+                    m = math.ceil(total_expert_dim / intermediate_size)
 
                     if self.config.mone['mone_use_expert_gate']:
-                        gate_proj_weight = original_mlp.gate_proj.weight.data # (intermediate_size, hidden_size)
+                        gate_proj_weight = original_mlp.gate_proj.weight.data  # shape: (intermediate_size, hidden_size)
                         if m > 1:
-                            gate_proj_weight = gate_proj_weight.repeat(m, 1) # (m * intermediate_size, hidden_size)
+                            gate_proj_weight = gate_proj_weight.repeat(m, 1)  # shape: (m * intermediate_size, hidden_size)
+                        # 截取正好 total_expert_dim 行，多余部分丢弃
+                        gate_proj_weight = gate_proj_weight[:total_expert_dim, :]
+                        # 接下来的 reshape 操作要求行数正好为 num_experts * expert_dim
                         gate_proj_weight_reshaped = gate_proj_weight.view(num_experts, expert_dim, hidden_size).transpose(1, 2)
                         gate_proj_weight_flat = gate_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
                     
                     up_proj_weight = original_mlp.up_proj.weight.data
                     if m > 1:
                         up_proj_weight = up_proj_weight.repeat(m, 1)
+                    up_proj_weight = up_proj_weight[:total_expert_dim, :]
                     up_proj_weight_reshaped = up_proj_weight.view(num_experts, expert_dim, hidden_size).transpose(1, 2)
                     up_proj_weight_flat = up_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
                     
                     down_proj_weight = original_mlp.down_proj.weight.data.t()
                     if m > 1:
                         down_proj_weight = down_proj_weight.repeat(m, 1)
+                    down_proj_weight = down_proj_weight[:total_expert_dim, :]
                     down_proj_weight_reshaped = down_proj_weight.view(num_experts, expert_dim, hidden_size)
                     down_proj_weight_flat = down_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
                     
