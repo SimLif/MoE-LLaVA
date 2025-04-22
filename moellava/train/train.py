@@ -1431,6 +1431,13 @@ def train():
             else:
                 p.requires_grad = False
 
+    if not model_args.moe_enable:
+        for n, p in model.named_parameters():
+            if ('mlp' in n) and ('visual' not in n):
+                p.requires_grad = True
+            else:
+                p.requires_grad = False 
+
     if 'mpt' in model_args.model_name_or_path:
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             model_args.model_name_or_path,
@@ -1664,17 +1671,17 @@ def train():
     else:
         safe_save_model_for_hf_trainer(trainer=trainer,
                                        output_dir=training_args.output_dir)
-        if model_args.moe_enable:
-            ckpt = model.state_dict()
-            # import ipdb
-            # ipdb.set_trace()
-            ckpt = {(k[11:] if k.startswith('base_model.') else k): v for k, v in ckpt.items()}
-            if any(k.startswith('model.model.') for k in ckpt):
-                ckpt = {(k[6:] if k.startswith('model.') else k): v for k, v in ckpt.items()}
-            torch.save(ckpt, os.path.join(training_args.output_dir, 'pytorch_model.bin'))
-            model.config.save_pretrained(training_args.output_dir)
-            if training_args.local_rank == 0 or training_args.local_rank == -1:
-                [os.remove(i) for i in glob(os.path.join(training_args.output_dir, 'adapter_*'))]
+        # if model_args.moe_enable:
+        ckpt = model.state_dict()
+        # import ipdb
+        # ipdb.set_trace()
+        ckpt = {(k[11:] if k.startswith('base_model.') else k): v for k, v in ckpt.items()}
+        if any(k.startswith('model.model.') for k in ckpt):
+            ckpt = {(k[6:] if k.startswith('model.') else k): v for k, v in ckpt.items()}
+        torch.save(ckpt, os.path.join(training_args.output_dir, 'pytorch_model.bin'))
+        model.config.save_pretrained(training_args.output_dir)
+        if training_args.local_rank == 0 or training_args.local_rank == -1:
+            [os.remove(i) for i in glob(os.path.join(training_args.output_dir, 'adapter_*'))]
     # print(model.state_dict().keys())
 
     import torch.distributed as dist
