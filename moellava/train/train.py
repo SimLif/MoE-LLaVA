@@ -1424,6 +1424,13 @@ def train():
         rank0_print(f'------------------------------- load from {model_args.from_pretrained_path} -------------------------------')
     # return
 
+    if model_args.kd_align:
+        for n, p in model.named_parameters():
+            if any(name in n for name in ["moe"]):
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
+
     if model_args.warm_up_experts:
         for n, p in model.named_parameters():
             if any(name in n for name in ["wg", "expert"]):
