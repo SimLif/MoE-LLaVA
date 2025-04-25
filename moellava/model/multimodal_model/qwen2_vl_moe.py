@@ -146,7 +146,7 @@ class CombinedLayer(nn.Module):
             base_moe_out, moe_aux_loss = moe_out, None
         
         if self.kd_align:
-            align_loss = F.mse_loss(mlp_out, base_moe_out)
+            align_loss = F.mse_loss(mlp_out.detach(), base_moe_out)
             return mlp_out, align_loss
         
         if self.use_gate:
@@ -1150,8 +1150,9 @@ class DenseMaskMoE(nn.Module):
 
         # 1. 专家路由：得到 l_aux, combine_weights, dispatch_mask, exp_counts
         if self.kd_align:
-            combine_dense = generate_routing_tensor(N, self.num_experts, self.k, self.x.device, self.x.dtype)
-            l_aux = torch.tensor(0.0, device=self.x.device, dtype=self.x.dtype)
+            combine_dense = generate_routing_tensor(N, self.num_experts, self.k, device=x.device, dtype=x.dtype)
+            l_aux = None
+            exp_counts = None
         else:
             if self.gate_type == "token_gating":
                 l_aux, combine_weights, dispatch_mask, exp_counts = self.gate(x)
@@ -1596,25 +1597,21 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
 
         hidden_states = outputs[0]
 
-        if not self.config.moe['kd_align']:
-            logits = self.lm_head(hidden_states)
-            logits = logits.float()
+        logits = self.lm_head(hidden_states)
+        logits = logits.float()
 
-            loss = None
-            if labels is not None:
-                # Shift so that tokens < n predict n
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-                # Flatten the tokens
-                loss_fct = CrossEntropyLoss()
-                shift_logits = shift_logits.view(-1, self.config.vocab_size)
-                shift_labels = shift_labels.view(-1)
-                # Enable model parallelism
-                shift_labels = shift_labels.to(shift_logits.device)
-                loss = loss_fct(shift_logits, shift_labels)
-        else:
-            logits = 0
-            loss = 0
+        loss = None
+        if labels is not None:
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            loss_fct = CrossEntropyLoss()
+            shift_logits = shift_logits.view(-1, self.config.vocab_size)
+            shift_labels = shift_labels.view(-1)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            loss = loss_fct(shift_logits, shift_labels)
 
         moe_loss, moe_losses = None, []
         if hasattr(outputs, "moe_loss_list") and outputs.moe_loss_list and len(outputs.moe_loss_list) > 0:
@@ -1624,9 +1621,11 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                     moe_losses.append(moe_loss_item)
             if moe_losses:
                 moe_loss = self.router_aux_loss_coef * sum(moe_losses)
-                if labels is not None:
+                if (labels is not None) and (not self.config.moe['kd_align']):
                     # print(f"Loss: {loss}, MoE Loss: {sum(moe_losses)}, Total: {loss + moe_loss}")
                     loss += moe_loss
+                else:
+                    loss = moe_loss + 0 * loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]
