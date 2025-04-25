@@ -69,6 +69,7 @@ class ModelArguments:
     from_pretrained: bool = False
     from_pretrained_path: str = ""
     warm_up_experts: bool = False
+    kd_align: bool = False
 
 @dataclass
 class DataArguments:

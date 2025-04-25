@@ -32,6 +32,49 @@ def rank0_print(*args):
         print(*args)
 
 
+def generate_routing_tensor(N, num_experts, k, non_uniform=True, device=None, dtype=torch.float):
+    """
+    生成形状为 [N, num_experts] 的随机 tensor，用于模拟路由结果，
+    每一行随机选择 k 个专家位置，其余位置置为 0，且非零值归一化后和为 1。
+    
+    Args:
+        N (int): 行数，例如 batch_size.
+        num_experts (int): 专家总数，即每行维度.
+        k (int): 每行选取的专家数量.
+        non_uniform (bool): 若为 True，则 top-k 位置分配随机值（非均匀分布）；否则均匀分布（相当于 softmax(0)=均匀分布）。
+        device (torch.device, optional): 设备，默认为 CPU.
+        dtype (torch.dtype, optional): 数据类型，默认为 torch.float.
+    
+    Returns:
+        Tensor: 形状为 [N, num_experts] 的路由结果，每行只有 k 个非零元素，和为 1.
+    """
+    if device is None:
+        device = torch.device("cpu")
+
+    # 1. 随机生成每一行的分数
+    scores = torch.rand(N, num_experts, device=device, dtype=dtype)
+    
+    # 2. 每一行选取 top k 个位置作为专家 (不放回采样)
+    _, topk_indices = scores.topk(k, dim=1, largest=True, sorted=False)  # shape: [N, k]
+    
+    # 3. 构造一个全 -inf 的矩阵，使得未选的位置 softmax 后概率为 0
+    masked_scores = torch.full((N, num_experts), float('-inf'), device=device, dtype=dtype)
+    
+    # 4. 为 top-k 位置赋值（随机或均值均可）
+    if non_uniform:
+        topk_values = torch.rand(N, k, device=device, dtype=dtype)
+    else:
+        topk_values = torch.zeros(N, k, device=device, dtype=dtype)
+    
+    # 将 top-k 的值填充到对应位置
+    masked_scores.scatter_(1, topk_indices, topk_values)
+    
+    # 5. softmax 计算路由概率，未选位置由于 exp(-inf)=0，会产生只有 k 个非零概率且和为 1 的分布
+    routing_tensor = F.softmax(masked_scores, dim=1)
+    
+    return routing_tensor
+
+
 # 定义小专家类
 class SmallExpert(nn.Module):
     def __init__(self, hidden_size, r, dropout_rate=0.0):
@@ -52,7 +95,7 @@ class SmallExpert(nn.Module):
 # 定义组合层，结合原始MLP和MoE
 class CombinedLayer(nn.Module):
     def __init__(self, shared, moe, use_gate=False, gate_type='ds',
-                 gate_dropout=0.0, hidden_size=0, cmr_target=0.8):
+                 gate_dropout=0.0, hidden_size=0, cmr_target=0.8, kd_align=False):
         """
         Args:
             shared: 共享的 MLP（或 FFN）模块
@@ -72,6 +115,7 @@ class CombinedLayer(nn.Module):
         self.gate_type = gate_type
         self.gate_dropout = gate_dropout
         self.cmr_target = cmr_target
+        self.kd_align = kd_align
         
         if use_gate:
             if self.gate_type == 'ds':
@@ -100,6 +144,10 @@ class CombinedLayer(nn.Module):
             base_moe_out, moe_aux_loss = moe_out[0], moe_out[1]
         else:
             base_moe_out, moe_aux_loss = moe_out, None
+        
+        if self.kd_align:
+            align_loss = F.mse_loss(mlp_out, base_moe_out)
+            return mlp_out, align_loss
         
         if self.use_gate:
             # 为了数值稳定性，先转换为 fp32 再送入 gate 层
@@ -956,6 +1004,7 @@ class DenseMaskMoE(nn.Module):
         activation: str = "silu",
         use_expert_gate: bool = False,
         gate_type: str = "token_gating",
+        kd_align: bool = False,
     ):
         """
         Args:
@@ -977,25 +1026,26 @@ class DenseMaskMoE(nn.Module):
         self.k = k
         self.use_expert_gate = use_expert_gate
         self.gate_type = gate_type
+        self.kd_align = kd_align
 
-        # 使用 deepspeed 的 TopKGate 进行专家路由
-        if gate_type == 'token_gating':
-            self.gate = TopKGate(
-                model_dim=hidden_size,
-                num_experts=num_experts,
-                k=k,
-                capacity_factor=capacity_factor,
-                eval_capacity_factor=eval_capacity_factor,
-                min_capacity=min_capacity,
-                drop_tokens=True,
-            )
-        elif gate_type == 'dense_gating':
-            self.gate = DenseGate(
-                model_dim=hidden_size,
-                num_experts=num_experts,
-            )
-        else:
-            raise ValueError(f"Unsupported gate type: {gate_type}")
+        if not self.kd_align:
+            if gate_type == 'token_gating':
+                self.gate = TopKGate(
+                    model_dim=hidden_size,
+                    num_experts=num_experts,
+                    k=k,
+                    capacity_factor=capacity_factor,
+                    eval_capacity_factor=eval_capacity_factor,
+                    min_capacity=min_capacity,
+                    drop_tokens=True,
+                )
+            elif gate_type == 'dense_gating':
+                self.gate = DenseGate(
+                    model_dim=hidden_size,
+                    num_experts=num_experts,
+                )
+            else:
+                raise ValueError(f"Unsupported gate type: {gate_type}")
 
         self.dropout = nn.Dropout(dropout)
         
@@ -1099,14 +1149,18 @@ class DenseMaskMoE(nn.Module):
         N = x.size(0)
 
         # 1. 专家路由：得到 l_aux, combine_weights, dispatch_mask, exp_counts
-        if self.gate_type == "token_gating":
-            l_aux, combine_weights, dispatch_mask, exp_counts = self.gate(x)
-            # 将 combine_weights 在 capacity 维度上求和，形状：[N, num_experts]
-            combine_weights = combine_weights.to(x.dtype)
-            combine_dense = combine_weights.sum(dim=-1)
-        elif self.gate_type == "dense_gating":
-            l_aux, combine_dense, _, exp_counts = self.gate(x)
-            combine_dense = combine_dense.to(x.dtype)
+        if self.kd_align:
+            combine_dense = generate_routing_tensor(N, self.num_experts, self.k, self.x.device, self.x.dtype)
+            l_aux = torch.tensor(0.0, device=self.x.device, dtype=self.x.dtype)
+        else:
+            if self.gate_type == "token_gating":
+                l_aux, combine_weights, dispatch_mask, exp_counts = self.gate(x)
+                # 将 combine_weights 在 capacity 维度上求和，形状：[N, num_experts]
+                combine_weights = combine_weights.to(x.dtype)
+                combine_dense = combine_weights.sum(dim=-1)
+            elif self.gate_type == "dense_gating":
+                l_aux, combine_dense, _, exp_counts = self.gate(x)
+                combine_dense = combine_dense.to(x.dtype)
 
         # 2. Fused 下投影：
         # 从 embedding 中恢复 expert_down_weight，形状为 [num_experts, hidden_size, expert_dim]
@@ -1541,21 +1595,26 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
         )
 
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
-        logits = logits.float()
 
-        loss = None
-        if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+        if not self.config.moe['kd_align']:
+            logits = self.lm_head(hidden_states)
+            logits = logits.float()
+
+            loss = None
+            if labels is not None:
+                # Shift so that tokens < n predict n
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                # Flatten the tokens
+                loss_fct = CrossEntropyLoss()
+                shift_logits = shift_logits.view(-1, self.config.vocab_size)
+                shift_labels = shift_labels.view(-1)
+                # Enable model parallelism
+                shift_labels = shift_labels.to(shift_logits.device)
+                loss = loss_fct(shift_logits, shift_labels)
+        else:
+            logits = 0
+            loss = 0
 
         moe_loss, moe_losses = None, []
         if hasattr(outputs, "moe_loss_list") and outputs.moe_loss_list and len(outputs.moe_loss_list) > 0:
@@ -1622,6 +1681,7 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
         self.config.moe['use_combined_gate'] = model_args.use_combined_gate
         self.config.moe['combined_gate_type'] = model_args.combined_gate_type
         self.config.moe['combined_gate_drop'] = model_args.combined_gate_drop
+        self.config.moe['kd_align'] = model_args.kd_align
         
         # Freeze all parameters except those specified in train_modules
         if self.config.moe['train_modules'] is not None and len(self.config.moe['train_modules']) > 0:
@@ -1731,6 +1791,7 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                         min_capacity=model_args.min_capacity,
                         use_expert_gate=model_args.mone_use_expert_gate,
                         gate_type=model_args.mone_gate_type,
+                        kd_align=model_args.kd_align,
                     )
                 else:
                     raise NotImplementedError(f"Unsupported expert type: {model_args.mone_expert_type}")
@@ -1789,7 +1850,8 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                     self.config.moe['use_combined_gate'], 
                     self.config.moe['combined_gate_type'],
                     self.config.moe['combined_gate_drop'],
-                    self.config.hidden_size
+                    self.config.hidden_size,
+                    kd_align=self.config.moe['kd_align'],
                 )
             self.model.layers[layer_num].mlp = moe_layer
 
