@@ -1413,6 +1413,8 @@ def train():
             model_type = 'moe-qwen2-vl'
             if model_args.mone_expert_type == 'dense_mask_expert':
                 model_type += '-ds'
+            if 'kd' in model_args.k_experts_path:
+                model_type += '-kd'
             model = initialize_moe_with_pretrained_weights(model, model_k, model.config.moe['moe_layers_idx'], model_type)
         del model_k
     
