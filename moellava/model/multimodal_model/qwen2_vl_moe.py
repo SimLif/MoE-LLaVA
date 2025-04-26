@@ -1632,7 +1632,7 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                 if (labels is not None) and (not self.config.moe['kd_align']):
                     # print(f"Loss: {loss}, MoE Loss: {sum(moe_losses)}, Total: {loss + moe_loss}")
                     loss += moe_loss
-                else:
+                if self.config.moe.get('kd_align', False):
                     loss = moe_loss + 0 * loss
 
         if not return_dict:
