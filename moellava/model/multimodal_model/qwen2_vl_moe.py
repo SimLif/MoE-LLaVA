@@ -95,7 +95,7 @@ class SmallExpert(nn.Module):
 # 定义组合层，结合原始MLP和MoE
 class CombinedLayer(nn.Module):
     def __init__(self, shared, moe, use_gate=False, gate_type='ds',
-                 gate_dropout=0.0, hidden_size=0, cmr_target=0.8, kd_align=False):
+                 gate_dropout=0.0, hidden_size=0, cmr_target=0.8, structure='new', kd_align=False):
         """
         Args:
             shared: 共享的 MLP（或 FFN）模块
@@ -109,8 +109,13 @@ class CombinedLayer(nn.Module):
             cmr_target: 对于 cmr gate，预算约束的目标概率值 (例如 0.8 表示希望 MoE 分支占 80%)
         """
         super().__init__()
-        self.shared = shared
-        self.moe = moe
+        self.structure = structure
+        if structure == 'new':
+            self.shared = shared
+            self.moe = moe
+        elif structure == 'old':
+            self.original_mlp = shared
+            self.moe_layer = moe
         self.use_gate = use_gate
         self.gate_type = gate_type
         self.gate_dropout = gate_dropout
@@ -136,8 +141,12 @@ class CombinedLayer(nn.Module):
             aux_loss_total: 如存在辅助损失，则返回。否则为 None
         """
         # 先分别计算共享层和 MoE 层的输出
-        mlp_out = self.shared(x)
-        moe_out = self.moe(x)
+        if self.structure == 'new':
+            mlp_out = self.shared(x)
+            moe_out = self.moe(x)
+        elif self.structure == 'old':
+            mlp_out = self.original_mlp(x)
+            moe_out = self.moe_layer(x)
         
         # 处理 MoE 层可能返回 (output, aux_loss) 的情况
         if isinstance(moe_out, tuple) and len(moe_out) >= 2:
@@ -1596,7 +1605,6 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
         )
 
         hidden_states = outputs[0]
-
         logits = self.lm_head(hidden_states)
         logits = logits.float()
 
@@ -1974,13 +1982,15 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
                     use_residual=self.config.moe.get('use_residual'),
                 )
             if self.config.moe.get('use_shared_experts', False):
+                print(f"self.config.moe.get('structure', 'new'),: {self.config.moe.get('structure', 'new')}")
                 moe_layer = CombinedLayer(
                     original_mlp, 
                     moe_layer, 
                     self.config.moe.get('use_combined_gate', False),
                     self.config.moe.get('combined_gate_type', False),
                     self.config.moe.get('combined_gate_drop', False),
-                    self.config.hidden_size
+                    self.config.hidden_size,
+                    structure=self.config.moe.get('structure', 'new'),
                 )
             self.model.layers[layer_num].mlp = moe_layer
 
