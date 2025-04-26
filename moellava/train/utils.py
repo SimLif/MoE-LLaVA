@@ -268,6 +268,9 @@ class SupervisedDataset(Dataset):
         self.model_id = model_id
         self.processor = processor
         self.list_data_dict = list_data_dict
+        # random sample half of the data
+        # import random
+        # self.list_data_dict = random.sample(self.list_data_dict, len(self.list_data_dict) // 5 * 2)
         self.data_args = data_args
         self.padding = padding
         self.image_min_pixel = data_args.image_min_pixels
