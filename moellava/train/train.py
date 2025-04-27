@@ -1415,6 +1415,8 @@ def train():
                 model_type += '-ds'
             if 'kd' in model_args.k_experts_path:
                 model_type += '-kd'
+                if 'g' in model_args.k_experts_path:
+                    model_type += '-g'
             model = initialize_moe_with_pretrained_weights(model, model_k, model.config.moe['moe_layers_idx'], model_type)
         del model_k
     
