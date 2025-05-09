@@ -1164,12 +1164,12 @@ class DenseMaskMoE(nn.Module):
             exp_counts = None
         else:
             if self.gate_type == "token_gating":
-                l_aux, combine_weights, dispatch_mask, exp_counts = self.gate(x)
+                l_aux, combine_weights, dispatch_mask, self.exp_counts = self.gate(x)
                 # 将 combine_weights 在 capacity 维度上求和，形状：[N, num_experts]
                 combine_weights = combine_weights.to(x.dtype)
                 combine_dense = combine_weights.sum(dim=-1)
             elif self.gate_type == "dense_gating":
-                l_aux, combine_dense, _, exp_counts = self.gate(x)
+                l_aux, combine_dense, _, self.exp_counts = self.gate(x)
                 combine_dense = combine_dense.to(x.dtype)
 
         # 2. Fused 下投影：
@@ -1200,14 +1200,15 @@ class DenseMaskMoE(nn.Module):
         #   output[n, h] = sum_{e, b} combine_dense[n, e] * intermediate_all[n, e, b] * expert_up_weight[e, b, h]
         output = torch.einsum('ne, neb, ebh -> nh', combine_dense, intermediate_all, expert_up_weight)
 
-        # co_occurrence = self.count_expert_cooccurrence(combine_dense)
+        # self.co_occurrence = self.count_expert_cooccurrence(combine_dense)
+        self.combine_dense = combine_dense
         # ranked_pairs = self.compute_jaccard_scores(co_occurrence, exp_counts)
         # print(f"Co-occurrence matrix: {co_occurrence}")
         # print(f"Ranked pairs: {ranked_pairs[:3]}")
 
         # 恢复原始形状（例如 [batch_size, seq_len, hidden_size]）
         output = output.view(*orig_shape)
-        return output, l_aux, exp_counts
+        return output, l_aux, self.exp_counts
 
 
 class MoEQwen2VLConfig(Qwen2VLConfig):
