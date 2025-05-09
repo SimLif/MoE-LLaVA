@@ -1417,11 +1417,22 @@ def train():
                 model_type += '-kd'
                 if 'g' in model_args.k_experts_path:
                     model_type += '-g'
+            if 'ada' in model_args.k_experts_path:
+                model_type += '-ada'
+            if 'share' in model_args.k_experts_path:
+                model_type += '-share'
             model = initialize_moe_with_pretrained_weights(model, model_k, model.config.moe['moe_layers_idx'], model_type)
         del model_k
     
     if model_args.from_pretrained:
         state_dict = torch.load(model_args.from_pretrained_path, map_location="cpu")
+        config = json.load(open(model_args.from_pretrained_path.replace('pytorch_model.bin', 'config.json'), 'r'))
+        if config['moe'].get('structure', "new") == "old":
+            for k in list(state_dict.keys()):
+                if 'moe_layer' in k:
+                    state_dict[k.replace('moe_layer', 'moe')] = state_dict.pop(k)
+                elif 'original_mlp' in k:
+                    state_dict[k.replace('original_mlp', 'shared')] = state_dict.pop(k)
         incompatible = model.load_state_dict(state_dict, strict=False)
         print("Missing keys:", incompatible.missing_keys)
         print("Unexpected keys:", incompatible.unexpected_keys)

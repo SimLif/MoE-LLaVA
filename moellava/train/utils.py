@@ -78,6 +78,34 @@ def initialize_moe_with_pretrained_weights(model_new, model_pretrained, layer_in
                 "model.layers.{i}.mlp.expert_gate.weight",
             ]  
         },
+        'moe-qwen2-vl-ds-ada': {
+            'target_param_names': [
+                "model.layers.{i}.mlp.gate.wg.weight", 
+                "model.layers.{i}.mlp.expert_down.weight",
+                "model.layers.{i}.mlp.expert_up.weight",
+                "model.layers.{i}.mlp.expert_gate.weight",
+            ],
+            'source_param_names': [
+                "model.layers.{i}.mlp.gate.wg.weight", 
+                "model.layers.{i}.mlp.expert_down.weight",
+                "model.layers.{i}.mlp.expert_up.weight",
+                "model.layers.{i}.mlp.expert_gate.weight",
+            ]  
+        },
+        'moe-qwen2-vl-ds-ada-share': {
+            'target_param_names': [
+                "model.layers.{i}.mlp.moe.gate.wg.weight",
+                "model.layers.{i}.mlp.moe.expert_down.weight",
+                "model.layers.{i}.mlp.moe.expert_up.weight",
+                "model.layers.{i}.mlp.moe.expert_gate.weight",
+            ],
+            'source_param_names': [
+                "model.layers.{i}.mlp.moe.gate.wg.weight",
+                "model.layers.{i}.mlp.moe.expert_down.weight",
+                "model.layers.{i}.mlp.moe.expert_up.weight",
+                "model.layers.{i}.mlp.moe.expert_gate.weight",
+            ]  
+        },
         'moe-qwen2-vl-ds-kd': {
             'target_param_names': [
                 "model.layers.{i}.mlp.expert_down.weight",
