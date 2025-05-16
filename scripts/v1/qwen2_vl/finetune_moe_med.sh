@@ -6,6 +6,7 @@ top_k_experts=2
 use_residual=False
 router_aux_loss_coef=0.01
 JSON_FOLDER="/mnt/data/haoqiang/workspace/data/medmoe-vqa/3vqa"
+# JSON_FOLDER="/mnt/data/haoqiang/workspace/data/mmed"
 # JSON_FOLDER="/mnt/data/haoqiang/workspace/data/biomed-visual-instructions"
 IMAGE_FOLDER="/mnt/data/haoqiang/workspace/data/medmoe-vqa/images"
 # IMAGE_FOLDER="/mnt/data/haoqiang/workspace/data/pubmedvision/images"
@@ -26,7 +27,17 @@ deepspeed --include=localhost:3,4 --master_port=29506 moellava/train/train_mem.p
     --k_experts_path /mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-4096e2-med-k-ns-ee-1363k/checkpoint-42508\
     --image_min_pixels $((16 * 28 * 28)) \
     --image_max_pixels $((576 * 28 * 28)) \
+    --skip_moe_init False \
+    --load_k_experts False \
+    --k_experts_path /mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-12e4-ada-nano-ds-tok-share-1epoch \
+    --from_pretrained False \
+    --from_pretrained_path /mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-96e32-mmed-nano-ds-tok-share-1epoch/pytorch_model.bin \
+    --warm_up_experts False \
     --use_shared_experts True \
+    --use_combined_gate False \
+    --combined_gate_type cmr \
+    --freeze_shared False \
+    --unfreeze_shared_epoch 1 \
     --mone_enable True \
     --mone_expert_type "embedding_expert" \
     --mone_gate_type "token_gating" \
