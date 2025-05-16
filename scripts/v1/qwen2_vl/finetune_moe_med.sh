@@ -22,9 +22,6 @@ deepspeed --include=localhost:3,4 --master_port=29506 moellava/train/train_mem.p
     --train_modules mlp.gate_proj mlp.up_proj mlp.down_proj wg \
     --deepspeed ./scripts/zero2.json \
     --model_name_or_path /mnt/data/haoqiang/workspace/models/qwen2-vl-2b-instruct \
-    --skip_moe_init False \
-    --load_k_experts False \
-    --k_experts_path /mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-4096e2-med-k-ns-ee-1363k/checkpoint-42508\
     --image_min_pixels $((16 * 28 * 28)) \
     --image_max_pixels $((576 * 28 * 28)) \
     --skip_moe_init False \
