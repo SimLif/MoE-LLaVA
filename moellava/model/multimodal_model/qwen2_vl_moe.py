@@ -26,6 +26,11 @@ from transformers.utils import ModelOutput
 
 local_rank = None
 
+try:
+    from .utils import TopKGateDynamic
+except:
+    pass
+
 
 def rank0_print(*args):
     if local_rank == 0:
@@ -76,20 +81,34 @@ def generate_routing_tensor(N, num_experts, k, non_uniform=True, device=None, dt
 
 
 # 定义小专家类
+# class SmallExpert(nn.Module):
+#     def __init__(self, hidden_size, r, dropout_rate=0.0):
+#         super().__init__()
+#         self.down_proj = nn.Linear(hidden_size, r, bias=False)
+#         self.act_fn = nn.SiLU()  # 与 Qwen2 MLP 保持一致
+#         self.dropout = nn.Dropout(dropout_rate)  # 可选的 dropout
+#         self.up_proj = nn.Linear(r, hidden_size, bias=False)
+        
+#     def forward(self, x):
+#         x = self.down_proj(x)
+#         x = self.act_fn(x)
+#         x = self.dropout(x)
+#         x = self.up_proj(x)
+#         return x
+
 class SmallExpert(nn.Module):
     def __init__(self, hidden_size, r, dropout_rate=0.0):
         super().__init__()
-        self.down_proj = nn.Linear(hidden_size, r, bias=False)
-        self.act_fn = nn.SiLU()  # 与 Qwen2 MLP 保持一致
-        self.dropout = nn.Dropout(dropout_rate)  # 可选的 dropout
-        self.up_proj = nn.Linear(r, hidden_size, bias=False)
-        
+        self.hidden_size = hidden_size
+        self.intermediate_size = r
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = nn.SiLU()
+
     def forward(self, x):
-        x = self.down_proj(x)
-        x = self.act_fn(x)
-        x = self.dropout(x)
-        x = self.up_proj(x)
-        return x
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
     
 
 # 定义组合层，结合原始MLP和MoE
@@ -1014,6 +1033,7 @@ class DenseMaskMoE(nn.Module):
         use_expert_gate: bool = False,
         gate_type: str = "token_gating",
         kd_align: bool = False,
+        expert_cluster_mask_list: List[Tensor] = None
     ):
         """
         Args:
@@ -1036,18 +1056,31 @@ class DenseMaskMoE(nn.Module):
         self.use_expert_gate = use_expert_gate
         self.gate_type = gate_type
         self.kd_align = kd_align
+        self.expert_cluster_mask_list = expert_cluster_mask_list
 
         if not self.kd_align:
             if gate_type == 'token_gating':
-                self.gate = TopKGate(
-                    model_dim=hidden_size,
-                    num_experts=num_experts,
-                    k=k,
-                    capacity_factor=capacity_factor,
-                    eval_capacity_factor=eval_capacity_factor,
-                    min_capacity=min_capacity,
-                    drop_tokens=True,
-                )
+                if expert_cluster_mask_list is None:
+                    self.gate = TopKGate(
+                        model_dim=hidden_size,
+                        num_experts=num_experts,
+                        k=k,
+                        capacity_factor=capacity_factor,
+                        eval_capacity_factor=eval_capacity_factor,
+                        min_capacity=min_capacity,
+                        drop_tokens=True,
+                    )
+                else:
+                    self.gate = TopKGateDynamic(
+                        model_dim=hidden_size,
+                        num_experts=num_experts,
+                        k=k,
+                        capacity_factor=capacity_factor,
+                        eval_capacity_factor=eval_capacity_factor,
+                        min_capacity=min_capacity,
+                        drop_tokens=True,
+                        expert_cluster_mask_list=expert_cluster_mask_list
+                    )
             elif gate_type == 'dense_gating':
                 self.gate = DenseGate(
                     model_dim=hidden_size,
@@ -1630,11 +1663,12 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                     moe_losses.append(moe_loss_item)
             if moe_losses:
                 moe_loss = self.router_aux_loss_coef * sum(moe_losses)
-                if (labels is not None) and (not self.config.moe['kd_align']):
+                if (labels is not None):
                     # print(f"Loss: {loss}, MoE Loss: {sum(moe_losses)}, Total: {loss + moe_loss}")
-                    loss += moe_loss
-                if self.config.moe.get('kd_align', False):
-                    loss = moe_loss + 0 * loss
+                    if self.config.moe.get('kd_align', False):
+                        loss = moe_loss + 0 * loss
+                    else:
+                        loss += moe_loss   
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -1811,46 +1845,82 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
 
                     # 计算复制因子，向上取整
                     if total_expert_dim % intermediate_size != 0:
-                        print(
-                            f"num_experts * expert_dim ({total_expert_dim}) "
-                            f"不能整除 intermediate_size ({intermediate_size})"
+                        print(f"\033[93mWarning: num_experts * expert_dim ({total_expert_dim}) "
+                            f"is not perfectly divisible by original_mlp intermediate_size ({intermediate_size}). "
+                            f"Weights will be repeated and truncated/padded.\033[0m"
                         )
                     m = math.ceil(total_expert_dim / intermediate_size)
+                    if m > 1 and m * intermediate_size != total_expert_dim:
+                            print(f"\033[93mWarning: not exact repetition of {m} for {intermediate_size} -> {total_expert_dim}\033[0m")
 
-                    if self.config.mone['mone_use_expert_gate']:
+                    if (self.config.mone['mone_use_expert_gate']) or (model_args.mone_expert_type == 'small_expert'):
                         gate_proj_weight = original_mlp.gate_proj.weight.data  # shape: (intermediate_size, hidden_size)
                         if m > 1:
                             gate_proj_weight = gate_proj_weight.repeat(m, 1)  # shape: (m * intermediate_size, hidden_size)
                         # 截取正好 total_expert_dim 行，多余部分丢弃
                         gate_proj_weight = gate_proj_weight[:total_expert_dim, :]
-                        # 接下来的 reshape 操作要求行数正好为 num_experts * expert_dim
-                        gate_proj_weight_reshaped = gate_proj_weight.view(num_experts, expert_dim, hidden_size).transpose(1, 2)
-                        gate_proj_weight_flat = gate_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
+                        if model_args.mone_expert_type in ['embedding_expert', 'dense_mask_expert']:
+                            # 接下来的 reshape 操作要求行数正好为 num_experts * expert_dim
+                            gate_proj_weight_reshaped = gate_proj_weight.view(num_experts, expert_dim, hidden_size).transpose(1, 2)
+                            gate_proj_weight_flat = gate_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
                     
                     up_proj_weight = original_mlp.up_proj.weight.data
                     if m > 1:
                         up_proj_weight = up_proj_weight.repeat(m, 1)
                     up_proj_weight = up_proj_weight[:total_expert_dim, :]
-                    up_proj_weight_reshaped = up_proj_weight.view(num_experts, expert_dim, hidden_size).transpose(1, 2)
-                    up_proj_weight_flat = up_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
+                    if model_args.mone_expert_type in ['embedding_expert', 'dense_mask_expert']:
+                        up_proj_weight_reshaped = up_proj_weight.view(num_experts, expert_dim, hidden_size).transpose(1, 2)
+                        up_proj_weight_flat = up_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
                     
                     down_proj_weight = original_mlp.down_proj.weight.data.t()
                     if m > 1:
                         down_proj_weight = down_proj_weight.repeat(m, 1)
                     down_proj_weight = down_proj_weight[:total_expert_dim, :]
-                    down_proj_weight_reshaped = down_proj_weight.view(num_experts, expert_dim, hidden_size)
-                    down_proj_weight_flat = down_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
+                    if model_args.mone_expert_type in ['embedding_expert', 'dense_mask_expert']:
+                        down_proj_weight_reshaped = down_proj_weight.view(num_experts, expert_dim, hidden_size)
+                        down_proj_weight_flat = down_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
                     
                     if model_args.mone_expert_type == 'embedding_expert':
-                        moe_layer.moe.expert_gate.weight.data.copy_(gate_proj_weight_flat)
+                        if self.config.mone['mone_use_expert_gate']:
+                            moe_layer.moe.expert_gate.weight.data.copy_(gate_proj_weight_flat)
                         moe_layer.moe.expert_down.weight.data.copy_(up_proj_weight_flat)
                         moe_layer.moe.expert_up.weight.data.copy_(down_proj_weight_flat)
                     elif model_args.mone_expert_type == 'dense_mask_expert':
-                        moe_layer.expert_gate.weight.data.copy_(gate_proj_weight_flat)
+                        if self.config.mone['mone_use_expert_gate']:
+                            moe_layer.expert_gate.weight.data.copy_(gate_proj_weight_flat)
                         moe_layer.expert_down.weight.data.copy_(up_proj_weight_flat)
                         moe_layer.expert_up.weight.data.copy_(down_proj_weight_flat)
+                    if model_args.mone_expert_type == 'small_expert':
+                        expert_module_list = moe_layer.deepspeed_moe.experts.deepspeed_experts
+                        down_proj_weight = down_proj_weight.t()
+                        for i in range(num_experts):
+                            expert = expert_module_list[i]
+                            
+                            # Calculate slicing indices for gate_proj/up_proj/down_pro
+                            start_idx = i * expert_dim
+                            end_idx = start_idx + expert_dim
 
-                    print(f'Successfully initialized weights for {num_experts} experts in layer {layer_num}')
+                            # Initialize gate_proj for expert i
+                            # Target shape: (r_expert_intermediate, hidden_size)
+                            slice_gate = gate_proj_weight[start_idx:end_idx, :]
+                            assert expert.gate_proj.weight.data.shape == slice_gate.shape, \
+                                f"Shape mismatch for expert {i} gate_proj: expected {expert.gate_proj.weight.data.shape}, got {slice_gate.shape}"
+                            expert.gate_proj.weight.data.copy_(slice_gate)
+
+                            # Initialize up_proj for expert i
+                            # Target shape: (r_expert_intermediate, hidden_size)
+                            slice_up = up_proj_weight[start_idx:end_idx, :]
+                            assert expert.up_proj.weight.data.shape == slice_up.shape, \
+                                f"Shape mismatch for expert {i} up_proj: expected {expert.up_proj.weight.data.shape}, got {slice_up.shape}"
+                            expert.up_proj.weight.data.copy_(slice_up)
+
+                            # Initialize down_proj for expert i
+                            # Target shape: (hidden_size, r_expert_intermediate)
+                            slice_down = down_proj_weight[:, start_idx:end_idx]
+                            assert expert.down_proj.weight.data.shape == slice_down.shape, \
+                                f"Shape mismatch for expert {i} down_proj: expected {expert.down_proj.weight.data.shape}, got {slice_down.shape}"
+                            expert.down_proj.weight.data.copy_(slice_down)
+                    print("\033[92m" + f"Successfully initialized weights for {num_experts} experts in layer {layer_num}" + "\033[0m")
             if model_args.use_shared_experts:
                 moe_layer = CombinedLayer(
                     self.model.layers[layer_num].mlp, 
@@ -1916,6 +1986,7 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
         self.router_aux_loss_coef = self.config.moe['router_aux_loss_coef']
         num_layers = self.config.num_hidden_layers
         moe_layers_idx = self.config.moe['moe_layers_idx']
+        expert_cluster_mask_dict = self.config.mone.get('expert_cluster_mask_dict', None)
 
         # Reinitialize MoE layers for evaluation
         for num_experts, layer_num in zip(self.config.moe.get('num_experts'), moe_layers_idx):
@@ -1957,6 +2028,15 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
                         use_expert_gate=self.config.mone.get('mone_use_expert_gate', False),    # 是否使用专家门控
                     )
                 elif mone_expert_type == 'dense_mask_expert':
+                    if expert_cluster_mask_dict is not None: 
+                        _expert_cluster_mask_list = expert_cluster_mask_dict[str(layer_num)]
+                        expert_cluster_mask_list = [] 
+                        for ele in _expert_cluster_mask_list:
+                            expert_cluster_mask = torch.zeros(1, num_experts)
+                            expert_cluster_mask[0, ele] = 1
+                            expert_cluster_mask_list.append(expert_cluster_mask.to(torch.bool))
+                    else:
+                        expert_cluster_mask_list = None
                     moe_layer = DenseMaskMoE(
                         self.config.hidden_size,
                         expert_dim=mone_r,
@@ -1967,6 +2047,7 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
                         min_capacity=self.config.moe.get('min_capacity'),
                         use_expert_gate=self.config.mone.get('mone_use_expert_gate', False),
                         gate_type=self.config.mone.get('mone_gate_type', 'token_gating'),
+                        expert_cluster_mask_list=expert_cluster_mask_list
                     )
                 else:
                     raise NotImplementedError(f"Unsupported expert type: {mone_expert_type}")
