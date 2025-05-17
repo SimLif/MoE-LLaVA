@@ -1,8 +1,10 @@
 #!/bin/bash
 
 moe_mode="sparse"
-num_experts=4096
+num_experts=6
 top_k_experts=2
+gpu_id=0
+epochs=5
 use_residual=False
 router_aux_loss_coef=0.01
 JSON_FOLDER="/mnt/data/haoqiang/workspace/data/medmoe-vqa/3vqa"
@@ -16,7 +18,7 @@ export NCCL_P2P_DISABLE=1
 export HF_DATASETS_OFFLINE=1 
 export TRANSFORMERS_OFFLINE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-deepspeed --include=localhost:3,4 --master_port=29506 moellava/train/train_mem.py \
+deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_id}+29500)) moellava/train/train_mem.py \
     --moe_enable True --num_experts ${num_experts} --top_k_experts ${top_k_experts} --capacity_factor 1.5 \
     --moe_mode ${moe_mode} --use_residual ${use_residual} --router_aux_loss_coef ${router_aux_loss_coef} \
     --train_modules mlp.gate_proj mlp.up_proj mlp.down_proj wg \
@@ -38,7 +40,7 @@ deepspeed --include=localhost:3,4 --master_port=29506 moellava/train/train_mem.p
     --mone_enable True \
     --mone_expert_type "embedding_expert" \
     --mone_gate_type "token_gating" \
-    --mone_r 4480 \
+    --mone_r $((8960/${top_k_experts})) \
     --mone_num_heads 1 \
     --mone_use_expert_gate True \
     --mone_load_original True \
@@ -52,8 +54,8 @@ deepspeed --include=localhost:3,4 --master_port=29506 moellava/train/train_mem.p
     --image_aspect_ratio pad \
     --group_by_modality_length True \
     --bf16 True \
-    --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-med-nano-ee-5epoch\
-    --num_train_epochs 5 \
+    --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-nano-s-tok-share-${epochs}epoch \
+    --num_train_epochs ${epochs} \
     --per_device_train_batch_size 4 \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps 4 \
