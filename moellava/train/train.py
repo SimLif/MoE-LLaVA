@@ -1455,10 +1455,10 @@ def train():
 
     if not model_args.moe_enable:
         for n, p in model.named_parameters():
-            if ('mlp' in n) and ('visual' not in n):
-                p.requires_grad = True
-            else:
-                p.requires_grad = False 
+            # if ('mlp' in n) and ('visual' not in n):
+            p.requires_grad = True
+            # else:
+                # p.requires_grad = False 
 
     if 'mpt' in model_args.model_name_or_path:
         tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -1627,7 +1627,7 @@ def train():
     for name, param in model.named_parameters():
         # param.requires_grad = True
         if param.requires_grad:
-            rank0_print(name)
+            rank0_print(f'{name}: {param.shape}')
     rank0_print(model)
     # sys.exit()
 
