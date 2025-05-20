@@ -16,6 +16,7 @@
 
 import os
 import copy
+import time
 import random
 import sys
 from dataclasses import dataclass, field
@@ -1671,10 +1672,106 @@ def train():
                         args=training_args,
                         **data_module)
 
+    # Statistics of time and memory usage. Part 1
+    # =============================================================================================================
+    STATS_JSON_FILE_PATH = training_args.stat_json_path
+    if training_args.enable_stat:
+        training_duration_seconds = None
+        peak_memory_gb = None
+        if training_args.local_rank == 0 or training_args.local_rank == -1:
+            stats_dir = os.path.dirname(STATS_JSON_FILE_PATH)
+            assert os.path.isdir(stats_dir), f"Error: Directory for statistics '{stats_dir}' does not exist."
+
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+
+            start_time = time.time()
+    # =============================================================================================================
+    
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
+    
+    # Statistics of time and memory usage. Part 2
+    # =============================================================================================================
+    if training_args.enable_stat:
+        if training_args.local_rank == 0 or training_args.local_rank == -1:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+            end_time = time.time()
+            training_duration_seconds = end_time - start_time
+
+            if torch.cuda.is_available():
+                peak_memory_bytes = torch.cuda.max_memory_allocated()
+                peak_memory_gb = peak_memory_bytes / (1024**3)
+            else:
+                peak_memory_gb = 0.0
+
+            if hasattr(model_args, 'moe_enable') and model_args.moe_enable:
+                shared_expert_str = "S" if getattr(model_args, 'use_shared_experts', False) else ""
+                num_experts_val = getattr(model_args, 'num_experts', 'N')[0]
+                top_k_experts_val = getattr(model_args, 'top_k_experts', 'M')
+                mone_expert_type_val = getattr(model_args, 'mone_expert_type', 'N/A_expert_type')
+                mone_gate_type_val = getattr(model_args, 'mone_gate_type', 'N/A_gate_type')
+                stats_key = f'{mone_expert_type_val}-{mone_gate_type_val}-{shared_expert_str}{num_experts_val}k{top_k_experts_val}'
+            else:
+                # 为非MoE模型或MoE参数不完全的配置提供一个通用key
+                model_name_for_key = os.path.basename(model_args.model_name_or_path) if model_args.model_name_or_path else "unknown_model"
+                stats_key = f'{model_name_for_key}'
+                if hasattr(training_args, 'lora_enable') and training_args.lora_enable:
+                    lora_r_val = getattr(training_args, 'lora_r', 'N/A')
+                    stats_key += f'-lora_r{lora_r_val}'
+                if hasattr(training_args, 'bits') and training_args.bits in [4, 8]:
+                    stats_key += f'-bits{training_args.bits}'
+                # 如果没有MoE且没有LoRA/bits等特定标识，加一个后缀区分
+                if not (stats_key.count('-') > 0): # 简单检查是否添加了后缀
+                    stats_key += '-standard'
+
+            current_run_stats = {
+                "training_time_seconds": round(training_duration_seconds, 2),
+                "peak_memory_usage_gb": round(peak_memory_gb, 2),
+                "max_steps_for_stat": training_args.max_steps, # 记录用于统计的max_steps
+                "model_path": training_args.output_dir, # 记录模型路径以供参考
+                "fp16": training_args.fp16,
+                "bf16": training_args.bf16,
+                "bits_quantization": training_args.bits if training_args.bits in [4,8] else "None"
+            }
+
+            # 加载已有的统计数据，或初始化为空字典
+            all_experiment_stats = {}
+            if os.path.exists(STATS_JSON_FILE_PATH):
+                try:
+                    with open(STATS_JSON_FILE_PATH, 'r') as f:
+                        all_experiment_stats = json.load(f)
+                except json.JSONDecodeError:
+                    print(f"Warning: {STATS_JSON_FILE_PATH} was corrupted or not valid JSON. Initializing new stats.")
+                    all_experiment_stats = {} # 如果文件损坏，则重新开始
+                except Exception as e:
+                    print(f"Error loading {STATS_JSON_FILE_PATH}: {e}. Initializing new stats.")
+                    all_experiment_stats = {}
+
+            # 更新字典
+            all_experiment_stats[stats_key] = current_run_stats
+
+            # 3. 保存到指定的JSON文件
+            try:
+                # 再次确保目录存在，以防在初始检查后发生变化或初始创建失败但未中止
+                stats_dir = os.path.dirname(STATS_JSON_FILE_PATH)
+                if not os.path.isdir(stats_dir):
+                    os.makedirs(stats_dir, exist_ok=True) # 尝试最后一次创建
+
+                with open(STATS_JSON_FILE_PATH, 'w') as f:
+                    json.dump(all_experiment_stats, f, indent=4)
+                print(f"Training statistics successfully saved to {STATS_JSON_FILE_PATH}")
+                print(f"Stats for key '{stats_key}': {current_run_stats}")
+            except IOError as e:
+                print(f"Error: Could not write statistics to {STATS_JSON_FILE_PATH}. IOError: {e}")
+            except Exception as e: #捕获其他可能的错误
+                print(f"An unexpected error occurred while saving statistics: {e}")
+    # =============================================================================================================
+
     trainer.save_state()
 
     model.config.use_cache = True

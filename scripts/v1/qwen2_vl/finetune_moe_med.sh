@@ -38,7 +38,7 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
     --freeze_shared False \
     --unfreeze_shared_epoch 1 \
     --mone_enable True \
-    --mone_expert_type "embedding_expert" \
+    --mone_expert_type ${expert_type} \
     --mone_gate_type "token_gating" \
     --mone_r $((8960/${top_k_experts})) \
     --mone_num_heads 1 \
@@ -56,12 +56,12 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
     --bf16 True \
     --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-nano-s-tok-share-${epochs}epoch \
     --num_train_epochs ${epochs} \
-    --per_device_train_batch_size 4 \
+    --per_device_train_batch_size ${batch_size} \
     --per_device_eval_batch_size 4 \
-    --gradient_accumulation_steps 4 \
+    --gradient_accumulation_steps $((16/${batch_size})) \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 24000 \
+    --save_steps 500 \
     --save_total_limit 1 \
     --learning_rate 2e-5 \
     --weight_decay 0. \
@@ -74,10 +74,20 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
     --dataloader_num_workers 8 \
     --lazy_preprocess True \
     --report_to wandb \
-    --run_name "3vqa-nano" \
+    --run_name ${run_name} \
     --cache_dir "./cache_dir"
 
 
 # --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-ada-nano-test\
 # --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e8x${top_k_experts}-med-nano-ee-smi-5e\
-    # --report_to wandb \
+# --report_to wandb \
+# --shared_lr 2e-5 \
+# --data_path ${JSON_FOLDER}/train_all_converted.json \
+
+# ${JSON_FOLDER}/adamllm-image-caption-and-synthetic-vqa.json \
+#                 ${JSON_FOLDER}/pubmedvision-instruction-vqa.json \
+#                 ${JSON_FOLDER}/nlp-tune-40k.json \
+#                 ${JSON_FOLDER}/en-medical-meadow-medical-flashcards-34k.json \
+#                 ${JSON_FOLDER}/zh-huatuo-knowledge-graph-qa-30k.json \
+# --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-med-ada-5epoch-test \
+# --max_steps 1000 
