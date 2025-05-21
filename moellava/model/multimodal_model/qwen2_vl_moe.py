@@ -1720,6 +1720,7 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
         self.config.moe['use_residual'] = model_args.use_residual
         self.config.moe['router_aux_loss_coef'] = self.router_aux_loss_coef = model_args.router_aux_loss_coef
         self.config.moe['use_shared_experts'] = model_args.use_shared_experts
+        self.config.moe['shared_expert_type'] = model_args.shared_expert_type
         self.config.moe['use_combined_gate'] = model_args.use_combined_gate
         self.config.moe['combined_gate_type'] = model_args.combined_gate_type
         self.config.moe['combined_gate_drop'] = model_args.combined_gate_drop
@@ -1838,6 +1839,7 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                 else:
                     raise NotImplementedError(f"Unsupported expert type: {model_args.mone_expert_type}")
 
+            shared_expert = None
             if getattr(model_args, 'mone_enable', False) and model_args.mone_load_original:
                 with torch.no_grad():
                     intermediate_size = original_mlp.gate_proj.weight.data.shape[0]
@@ -1854,28 +1856,28 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                             print(f"\033[93mWarning: not exact repetition of {m} for {intermediate_size} -> {total_expert_dim}\033[0m")
 
                     if (self.config.mone['mone_use_expert_gate']) or (model_args.mone_expert_type == 'small_expert'):
-                        gate_proj_weight = original_mlp.gate_proj.weight.data  # shape: (intermediate_size, hidden_size)
+                        gate_proj_weight_source = original_mlp.gate_proj.weight.data  # shape: (intermediate_size, hidden_size)
                         if m > 1:
-                            gate_proj_weight = gate_proj_weight.repeat(m, 1)  # shape: (m * intermediate_size, hidden_size)
+                            gate_proj_weight_source = gate_proj_weight_source.repeat(m, 1)  # shape: (m * intermediate_size, hidden_size)
                         # 截取正好 total_expert_dim 行，多余部分丢弃
-                        gate_proj_weight = gate_proj_weight[:total_expert_dim, :]
+                        gate_proj_weight = gate_proj_weight_source[:total_expert_dim, :]
                         if model_args.mone_expert_type in ['embedding_expert', 'dense_mask_expert']:
                             # 接下来的 reshape 操作要求行数正好为 num_experts * expert_dim
                             gate_proj_weight_reshaped = gate_proj_weight.view(num_experts, expert_dim, hidden_size).transpose(1, 2)
                             gate_proj_weight_flat = gate_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
                     
-                    up_proj_weight = original_mlp.up_proj.weight.data
+                    up_proj_weight_source = original_mlp.up_proj.weight.data
                     if m > 1:
-                        up_proj_weight = up_proj_weight.repeat(m, 1)
-                    up_proj_weight = up_proj_weight[:total_expert_dim, :]
+                        up_proj_weight_source = up_proj_weight_source.repeat(m, 1)
+                    up_proj_weight = up_proj_weight_source[:total_expert_dim, :]
                     if model_args.mone_expert_type in ['embedding_expert', 'dense_mask_expert']:
                         up_proj_weight_reshaped = up_proj_weight.view(num_experts, expert_dim, hidden_size).transpose(1, 2)
                         up_proj_weight_flat = up_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
                     
-                    down_proj_weight = original_mlp.down_proj.weight.data.t()
+                    down_proj_weight_source = original_mlp.down_proj.weight.data.t()
                     if m > 1:
-                        down_proj_weight = down_proj_weight.repeat(m, 1)
-                    down_proj_weight = down_proj_weight[:total_expert_dim, :]
+                        down_proj_weight_source = down_proj_weight_source.repeat(m, 1)
+                    down_proj_weight = down_proj_weight_source[:total_expert_dim, :]
                     if model_args.mone_expert_type in ['embedding_expert', 'dense_mask_expert']:
                         down_proj_weight_reshaped = down_proj_weight.view(num_experts, expert_dim, hidden_size)
                         down_proj_weight_flat = down_proj_weight_reshaped.reshape(num_experts, expert_dim * hidden_size)
@@ -1890,6 +1892,17 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                             moe_layer.expert_gate.weight.data.copy_(gate_proj_weight_flat)
                         moe_layer.expert_down.weight.data.copy_(up_proj_weight_flat)
                         moe_layer.expert_up.weight.data.copy_(down_proj_weight_flat)
+                        if model_args.use_shared_experts and model_args.shared_expert_type == 'small':
+                            shared_expert = SmallExpert(self.config.hidden_size, mone_r, mone_dropout)
+                            assert gate_proj_weight_source.shape[0] == total_expert_dim + expert_dim, \
+                                f"Shape mismatch for shared expert gate: expected {total_expert_dim + expert_dim}, got {gate_proj_weight.shape[0]}"
+                            gate_proj_weight_s = gate_proj_weight_source[total_expert_dim:total_expert_dim+expert_dim, :]
+                            up_proj_weight_s = up_proj_weight_source[total_expert_dim:total_expert_dim+expert_dim, :]
+                            down_proj_weight_s = down_proj_weight_source[total_expert_dim:total_expert_dim+expert_dim, :]
+                            shared_expert.gate_proj.weight.data.copy_(gate_proj_weight_s)
+                            shared_expert.up_proj.weight.data.copy_(up_proj_weight_s)
+                            shared_expert.down_proj.weight.data.copy_(down_proj_weight_s.t())
+                        
                     if model_args.mone_expert_type == 'small_expert':
                         expert_module_list = moe_layer.deepspeed_moe.experts.deepspeed_experts
                         down_proj_weight = down_proj_weight.t()
@@ -1922,8 +1935,15 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                             expert.down_proj.weight.data.copy_(slice_down)
                     print("\033[92m" + f"Successfully initialized weights for {num_experts} experts in layer {layer_num}" + "\033[0m")
             if model_args.use_shared_experts:
+                if shared_expert is not None:
+                    shared_expert = shared_expert
+                elif model_args.shared_expert_type == 'small':
+                    shared_expert = SmallExpert(self.config.hidden_size, mone_r, mone_dropout)
+                else:
+                    shared_expert = self.model.layers[layer_num].mlp
+
                 moe_layer = CombinedLayer(
-                    self.model.layers[layer_num].mlp, 
+                    shared_expert, 
                     moe_layer, 
                     self.config.moe['use_combined_gate'], 
                     self.config.moe['combined_gate_type'],
@@ -2065,8 +2085,12 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
                 )
             if self.config.moe.get('use_shared_experts', False):
                 print(f"self.config.moe.get('structure', 'new'),: {self.config.moe.get('structure', 'new')}")
+                if  self.config.moe.get('shared_expert_type', 'original') == 'small':
+                    shared_expert = SmallExpert(self.config.hidden_size, mone_r, mone_dropout)
+                else:
+                    shared_expert = original_mlp
                 moe_layer = CombinedLayer(
-                    original_mlp, 
+                    shared_expert, 
                     moe_layer, 
                     self.config.moe.get('use_combined_gate', False),
                     self.config.moe.get('combined_gate_type', False),
