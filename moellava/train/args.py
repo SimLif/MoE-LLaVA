@@ -51,6 +51,7 @@ class ModelArguments:
     load_k_experts: bool = False
     k_experts_path: Optional[str] = None
     use_shared_experts: bool = False
+    shared_expert_type: str = "original"
     mone_enable: bool = False
     mone_r: int = 128
     mone_dropout: float = 0.00
@@ -126,3 +127,5 @@ class TrainingArguments(transformers.TrainingArguments):
     merger_lr: Optional[float] = None
     freeze_shared: bool = False
     shared_lr: Optional[float] = None
+    enable_stat: bool = False
+    stat_json_path: str = '/mnt/data/haoqiang/workspace/05-moe-llava/scripts/v1/qwen2_vl/training_performance_stats.json'
