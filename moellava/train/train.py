@@ -1321,9 +1321,14 @@ def train():
         if training_args.lora_enable:
             from peft import LoraConfig, get_peft_model
             if 'qwen' in model_args.model_name_or_path.lower() and '1.5' not in model_args.model_name_or_path.lower():
-                target_modules = [
-                    'mlp.w1', 'mlp.w2', 'mlp.c_proj'
-                ] if training_args.only_lora_ffn else find_all_linear_names(model)
+                if '2' not in model_args.model_name_or_path.lower():
+                    target_modules = [
+                        'mlp.w1', 'mlp.w2', 'mlp.c_proj'
+                    ] if training_args.only_lora_ffn else find_all_linear_names(model)
+                else:
+                    target_modules = [
+                        'attn.qkv', 'attn.proj', 'mlp.fc1', 'mlp.fc2', 'merger.mlp.0', 'merger.mlp.2', "q_proj", "k_proj", "v_proj", "o_proj", 'up_proj', 'down_proj', 'gate_proj'
+                    ] if training_args.only_lora_ffn else find_all_linear_names(model)
             elif 'phi' in model_args.model_name_or_path.lower():
                 target_modules = [
                     'fc1', 'fc2'
@@ -1332,21 +1337,21 @@ def train():
                 target_modules = [
                     'up_proj', 'down_proj', 'gate_proj'
                 ] if training_args.only_lora_ffn else find_all_linear_names(model)
-            # modules_to_save = ['wg']  # weight gating for MoE
+            modules_to_save = ['wg']  # weight gating for MoE
             lora_config = LoraConfig(
                 r=training_args.lora_r,
                 lora_alpha=training_args.lora_alpha,
                 target_modules=target_modules,
                 lora_dropout=training_args.lora_dropout,
                 bias=training_args.lora_bias,
-                # modules_to_save=modules_to_save,
+                modules_to_save=modules_to_save,
                 task_type="CAUSAL_LM",
             )
             model_args.lora_r = training_args.lora_r
             model_args.lora_alpha = training_args.lora_alpha
             model_args.lora_dropout = training_args.lora_dropout
             model_args.lora_bias = training_args.lora_bias
-            # model_args.modules_to_save = modules_to_save
+            model_args.modules_to_save = modules_to_save
             model_args.target_modules = target_modules
             model_args.train_modules = target_modules
             if training_args.bits == 16:
@@ -1434,9 +1439,27 @@ def train():
                     state_dict[k.replace('moe_layer', 'moe')] = state_dict.pop(k)
                 elif 'original_mlp' in k:
                     state_dict[k.replace('original_mlp', 'shared')] = state_dict.pop(k)
+                # elif 'mlp' in k and 'visual' not in k:
+                #     state_dict[k.replace('mlp', 'shared')] = state_dict.pop(k)
+                #     pass
+        if training_args.lora_enable:
+            # add base_model.model in the state_dict
+            new_state_dict = {}
+            for old_key, value in state_dict.items():
+                new_key = f'base_model.model.{old_key}'
+                for target_module in target_modules:
+                    if f'.{target_module}.' in old_key:
+                        new_key = new_key.replace(f'.{target_module}.', f'.{target_module}.base_layer.')
+                        rank0_print(f'{old_key} -> {new_key}')
+                        break
+                new_state_dict[new_key] = value
+            state_dict = new_state_dict
+            # state_dict = {f'base_model.model.{k}': v for k, v in state_dict.items()}
         incompatible = model.load_state_dict(state_dict, strict=False)
-        print("Missing keys:", incompatible.missing_keys)
-        print("Unexpected keys:", incompatible.unexpected_keys)
+        if bool([k for k in incompatible.missing_keys if 'lora' not in k]):
+            rank0_print("Missing keys:", incompatible.missing_keys)
+            rank0_print("Unexpected keys:", incompatible.unexpected_keys)
+            raise ValueError(f"Some keys are missing in the checkpoint {model_args.from_pretrained_path}, {incompatible.missing_keys}")
         rank0_print(f'------------------------------- load from {model_args.from_pretrained_path} -------------------------------')
     # return
 
