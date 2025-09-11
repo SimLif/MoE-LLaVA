@@ -501,7 +501,7 @@ class SimilarityGate(nn.Module):
             group_first = torch.full((self.num_experts,), sorted_indices.numel(), device=flat_expert_indices_flat.device, dtype=torch.long)
             group_first[unique_experts] = starts
 
-            # 4. 计算全局排序中每个分配的“组内 rank”
+            # 4. 计算全局排序中每个分配的"组内 rank"
             ranks = torch.empty_like(sorted_indices, dtype=torch.long)
             # 令 ranks[sorted_indices] = [0, 1, 2, ... N-1]
             ranks[sorted_indices] = torch.arange(sorted_indices.size(0), device=flat_expert_indices_flat.device)
@@ -551,7 +551,7 @@ class SimilarityGate(nn.Module):
             # 每个 token 在自己所属组内的累积计数，即其在排序数组中的索引减去该组的起始索引
             group_rank_sorted = torch.arange(sorted_valid_idx.size(0), device=sorted_valid_idx.device) - group_start
 
-            # 6. 创建 flat_locations，并将计算好的组内累计位置“散射”回原来的位置
+            # 6. 创建 flat_locations，并将计算好的组内累计位置"散射"回原来的位置
             flat_locations = torch.zeros_like(flat_expert_indices_flat, dtype=torch.long)
             flat_locations[sorted_valid_idx] = group_rank_sorted
 
@@ -657,6 +657,172 @@ class DenseGate(nn.Module):
         l_aux = self.mutual_information_loss(gates)
 
         return l_aux, combine_weights, None, None
+
+
+@torch.jit.script
+def _one_hot_to_float(x, num_classes):
+    return F.one_hot(x, num_classes=num_classes).float()
+
+
+def topkgating_adaptive_grouping(
+    logits: Tensor,
+    k: int,
+    capacity_factor: float,
+    min_capacity: int,
+    group_sizes: Tensor,  # ### MODIFICATION 1: 新增 group_sizes 参数 ###
+    drop_tokens: bool = True,
+    ep_group: Union[torch.distributed.ProcessGroup, None] = None,
+    drop_policy: str = "position",
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """
+    Implements TopKGating with adaptive grouping enhancements.
+    - Load balancing loss is proportional to group size.
+    - Expert capacity is proportional to group size.
+    """
+
+    # everything is in fp32 in this function
+    gates = F.softmax(logits, dim=1)
+    num_tokens, num_groups = gates.shape[0], gates.shape[1]
+
+    # get topk gates
+    top_gate, top_idx = torch.topk(logits, k=k, dim=1)
+
+    # get topk mask for expert counts
+    mask = torch.zeros_like(gates, dtype=torch.bool).scatter_(1, top_idx, 1)
+    exp_counts = torch.sum(mask, dim=0).detach().to(logits.device)
+
+    # ### MODIFICATION 2: 替换 l_aux 计算 ###
+    # --- START MODIFICATION ---
+    # 计算加权的负载均衡损失 (KL散度)
+    if torch.sum(group_sizes) > 0:
+        # 目标分布：与群组规模成正比
+        target_distribution = group_sizes.float() / torch.sum(group_sizes)
+        # 实际分布：每个群组接收到的token比例
+        actual_distribution = exp_counts / num_tokens
+        
+        # 使用KL散度计算损失
+        l_aux = F.kl_div(
+            (actual_distribution + 1e-8).log(), 
+            target_distribution + 1e-8, 
+            reduction='sum'
+        )
+    else: # 如果所有群组都为空，则没有损失
+        l_aux = torch.tensor(0.0, device=logits.device)
+    # --- END MODIFICATION ---
+
+    if drop_tokens:
+        # ### MODIFICATION 3: 计算比例容量 ###
+        # --- START MODIFICATION ---
+        if drop_policy == 'probs':
+            # 如分析中所述，'probs'策略难以高效地与容量向量配合。
+            # 这里我们发出警告并退回至'position'策略，或者需要一个更复杂的实现。
+            # warnings.warn("drop_policy='probs' is not efficiently supported with proportional capacity. "
+            #               "Consider using drop_policy='position'.")
+            # 为保持代码可运行，此处我们强制要求使用'position'
+            if drop_policy != 'position':
+                 raise ValueError("Only drop_policy='position' is supported for adaptive grouping.")
+        
+        total_experts = torch.sum(group_sizes)
+        if total_experts > 0:
+            tokens_per_expert_avg = num_tokens / total_experts
+            # 计算每个群组的容量向量 [num_groups]
+            capacity = (group_sizes * tokens_per_expert_avg * capacity_factor)
+        else:
+            capacity = torch.zeros_like(group_sizes)
+
+        capacity = torch.clamp(capacity, min=min_capacity).long()
+        # --- END MODIFICATION ---
+
+        # update mask and locations by capacity
+        # 'position' 策略可以无缝地使用广播机制处理容量向量
+        locations = torch.cumsum(mask, dim=0) - 1
+        mask *= torch.lt(locations, capacity)
+
+    else:
+        # 这部分逻辑（不丢弃token）与原始版本类似，但仍可以从比例容量中受益
+        # 为简化，我们假设drop_tokens=True，因为这是MoE的常见做法
+        new_capacity = torch.max(exp_counts)
+        if ep_group is not None:
+            dist.all_reduce(new_capacity, op=dist.ReduceOp.MAX, group=ep_group)
+        capacity = new_capacity
+
+    # --- 后续逻辑基本保持不变 ---
+    
+    # normalize gates
+    gates_masked = gates * mask
+    gates_s = torch.sum(gates_masked, dim=-1, keepdim=True)
+    denom_s = torch.clamp(gates_s, min=torch.finfo(gates_masked.dtype).eps)
+    gates_masked = gates_masked / denom_s
+
+    # dispatch_mask
+    locations_sc = _one_hot_to_float((locations * mask), torch.max(capacity) if drop_tokens else capacity)
+    combine_weights = torch.einsum("se,sec->sec", gates_masked, locations_sc)
+    dispatch_mask = combine_weights.bool()
+
+    return l_aux, combine_weights, dispatch_mask, exp_counts
+
+
+class TopKGateAdaptiveGrouping(torch.nn.Module):
+    """
+    Gate module enhanced for Adaptive Expert Grouping.
+    It expects 'group_sizes' to be passed during the forward call.
+    """
+    wg: torch.nn.Linear
+
+    def __init__(self,
+                 model_dim: int,
+                 num_groups: int, # 现在是群组数量
+                 k: int = 1,
+                 capacity_factor: float = 1.0,
+                 eval_capacity_factor: float = 1.0,
+                 min_capacity: int = 8,
+                 noisy_gate_policy: Optional[str] = None,
+                 drop_tokens: bool = True,
+                 drop_policy: str = "position") -> None:
+        super().__init__()
+
+        # wg现在路由到群组，而不是专家
+        self.wg = torch.nn.Linear(model_dim, num_groups, bias=False)
+        self.k = k
+        self.capacity_factor = capacity_factor
+        self.eval_capacity_factor = eval_capacity_factor
+        self.min_capacity = min_capacity
+        self.noisy_gate_policy = noisy_gate_policy
+        self.drop_tokens = drop_tokens
+        self.drop_policy = drop_policy
+        
+        # 确保使用推荐的丢弃策略
+        if self.drop_tokens and self.drop_policy != "position":
+            print(f"Warning: For adaptive grouping, 'position' drop policy is recommended for efficiency. "
+                  f"You are using '{self.drop_policy}'.")
+
+
+    def forward(self,
+                input: torch.Tensor,
+                group_sizes: torch.Tensor, # ### MODIFICATION 4: forward方法接收group_sizes ###
+                ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+
+        input_fp32 = input.float()
+        if self.noisy_gate_policy == 'Jitter' and self.training:
+            # 假设 multiplicative_jitter 是一个已定义的函数
+            # input_fp32 = multiplicative_jitter(input_fp32, device=input.device)
+            pass
+        
+        logits = self.wg(input_fp32)
+
+        # ### MODIFICATION 5: 调用我们新的gating函数 ###
+        gate_output = topkgating_adaptive_grouping(
+            logits,
+            self.k,
+            self.capacity_factor if self.training else self.eval_capacity_factor,
+            self.min_capacity,
+            group_sizes, # 传递 group_sizes
+            self.drop_tokens,
+            ep_group=None, # 简化，不考虑分布式
+            drop_policy=self.drop_policy
+        )
+
+        return gate_output
 
 
 class EmbeddedExpertsMoE(nn.Module):
@@ -1242,6 +1408,269 @@ class DenseMaskMoE(nn.Module):
         # 恢复原始形状（例如 [batch_size, seq_len, hidden_size]）
         output = output.view(*orig_shape)
         return output, l_aux, self.exp_counts
+
+
+class AdaptiveGroupingMoE(nn.Module):
+    """
+    Adaptive Grouping Mixture-of-Experts (MoE) 层。
+    """
+    def __init__(
+        self,
+        hidden_size: int,
+        expert_dim: int,
+        num_experts: int,
+        max_groups: int,
+        sparsity_weight: float,
+        ortho_weight: float,
+        balance_weight: float,
+        load_balance_weight: float,
+        k: int,
+        capacity_factor: float = 1.0,
+        eval_capacity_factor: float = 1.0,
+        min_capacity: int = 8,
+        dropout: float = 0.0,
+        activation: str = "silu",
+        use_expert_gate: bool = False,
+    ):
+        """
+        Args:
+            hidden_size (int): 输入及输出的维度。
+            expert_dim (int): 每个专家的内部中间激活维度。
+            num_experts (int): 专家数量。
+            max_groups (int): 最大分组数。
+            sparsity_weight (float): 稀疏性正则化权重。
+            ortho_weight (float): 正交性正则化权重。
+            balance_weight (float): 平衡性正则化权重。
+            k (int): 每个 token 选择的 top-k 专家数。
+            capacity_factor (float): TopKGate 的 capacity_factor 参数。
+            eval_capacity_factor (float): TopKGate 的 eval_capacity_factor 参数。
+            min_capacity (int): TopKGate 的最小 capacity 参数。
+            dropout (float): dropout 概率。
+            activation (str): 激活函数类型，可选 "silu", "relu", "gelu"。
+            use_expert_gate (bool): 是否使用额外的专家门控参数。
+        """
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.expert_dim = expert_dim
+        self.num_experts = num_experts
+        self.max_groups = max_groups
+        self.sparsity_weight = sparsity_weight
+        self.ortho_weight = ortho_weight
+        self.balance_weight = balance_weight
+        self.load_balance_weight = load_balance_weight
+        self.k = k
+        self.use_expert_gate = use_expert_gate
+
+        self.gate = TopKGateAdaptiveGrouping(
+            model_dim=hidden_size,
+            num_experts=self.max_groups,
+            k=k,
+            capacity_factor=capacity_factor,
+            eval_capacity_factor=eval_capacity_factor,
+            min_capacity=min_capacity,
+            drop_tokens=True,
+        )
+
+        self.dropout = nn.Dropout(dropout)
+        
+        # 选择激活函数
+        if activation == "silu":
+            self.activation = F.silu
+        elif activation == "relu":
+            self.activation = F.relu
+        elif activation == "gelu":
+            self.activation = F.gelu
+        else:
+            raise ValueError(f"Unsupported activation: {activation}")
+
+        # Add embeds to group the experts
+        self.expert_embeds = nn.Embedding(num_experts, hidden_size)
+        self.group_embeds = nn.Embedding(self.max_groups, hidden_size)
+        nn.init.normal_(self.expert_embeds.weight, std=math.sqrt(2.0 / hidden_size))
+        nn.init.normal_(self.group_embeds.weight, std=math.sqrt(2.0 / hidden_size))
+
+        # 用 nn.Embedding 存储下投影参数，每个专家的参数 shape: [hidden_size * expert_dim]
+        self.expert_down = nn.Embedding(num_experts, hidden_size * expert_dim)
+        # 初始化并乘上合适的缩放因子
+        nn.init.normal_(self.expert_down.weight, std=math.sqrt(2.0 / (hidden_size + expert_dim)))
+        
+        # 上投影参数，每个专家的参数 shape: [expert_dim * hidden_size]
+        self.expert_up = nn.Embedding(num_experts, expert_dim * hidden_size)
+        nn.init.normal_(self.expert_up.weight, std=math.sqrt(1.0 / hidden_size))
+        
+        # 可选：专家内部门控参数，存储形状: [hidden_size * expert_dim]
+        if self.use_expert_gate:
+            self.expert_gate = nn.Embedding(num_experts, hidden_size * expert_dim)
+            nn.init.normal_(self.expert_gate.weight, std=math.sqrt(2.0 / (hidden_size + expert_dim)))
+
+
+    def count_expert_cooccurrence(self, combine_dense: torch.Tensor) -> torch.Tensor:
+        """
+        统计专家的共现情况。
+        
+        Args:
+            combine_dense (torch.Tensor): 形状为 [N, num_experts] 的张量，
+                每个 token 对各专家的激活权重（或者标志），非零表示激活。
+        
+        Returns:
+            co_occurrence_upper (torch.Tensor): 上三角的共现矩阵，形状为 [num_experts, num_experts]，
+                即 co_occurrence_upper[i, j] 表示专家 i 和专家 j 同时被激活的 token 数量（仅计算 i<j 部分）。
+        """
+        # 将 combine_dense 二值化（假定激活权重大于 0 表示激活）
+        # 如果 combine_dense 原本就是 0/1，则这个步骤可以省略
+        binary_mask = (combine_dense > 0).float()  # shape: [N, num_experts]
+        
+        # 计算共现矩阵：shape [num_experts, num_experts]
+        # 其中 entry (i, j) 表示有多少 token 同时激活了专家 i 和专家 j
+        co_occurrence = torch.matmul(binary_mask.transpose(0, 1), binary_mask)
+        
+        # 我们不关心自己与自己的共现，因此将对角线置 0
+        # co_occurrence.fill_diagonal_(0)
+        
+        # 如果只需要上三角部分（因为 C 是对称的）
+        co_occurrence_upper = torch.triu(co_occurrence, diagonal=1)
+        
+        return co_occurrence_upper
+    
+
+    def compute_jaccard_scores(self, co_occurrence: torch.Tensor, expert_activation_counts: torch.Tensor, min_count: int = 1):
+        """
+        根据 Jaccard 相似度计算专家对得分，并返回排名列表。
+        
+        Args:
+            co_occurrence (torch.Tensor): 专家共现矩阵，形状为 [num_experts, num_experts]（对角线为0）。
+            expert_activation_counts (torch.Tensor): 每个专家的激活总数，形状为 [num_experts]。
+            min_count (int): 只返回共现次数大于等于此阈值的专家对。
+            
+        Returns:
+            ranked_pairs (List[Tuple[int, int, float]]): 每个元素为 (expert_i, expert_j, jaccard_score)
+                值越大表示两个专家关系越紧密。
+        """
+        num_experts = co_occurrence.size(0)
+        pairs = []
+        for i in range(num_experts):
+            for j in range(i+1, num_experts):
+                co_count = co_occurrence[i, j].item()
+                if co_count < min_count:
+                    continue
+                # 计算两个专家的并集大小：C_i + C_j - C_ij
+                union = expert_activation_counts[i].item() + expert_activation_counts[j].item() - co_count
+                if union > 0:
+                    jaccard_score = co_count / union
+                    pairs.append((i, j, jaccard_score))
+        # 按照得分降序排序
+        ranked_pairs = sorted(pairs, key=lambda x: x[2], reverse=True)
+        return ranked_pairs
+    
+
+    def _get_group_assignment(self, gumbel_tau=1.0, hard=True):
+        """
+        计算专家到群组的分配，并返回分配矩阵及结构损失。
+        
+        Returns:
+            hard_assignment (torch.Tensor): 硬分配矩阵，形状为 [max_groups, num_experts]。
+            total_structure_loss (torch.Tensor): 汇总的结构损失（稀疏性 + 正交性）。
+        """
+        
+        # 假设 self.group_embeds 和 self.expert_embeds 是 nn.Embedding 层
+        # 亲和度矩阵 [max_groups, num_experts]
+        group_assignment_logits = self.group_embeds.weight @ self.expert_embeds.weight.T
+        
+        # 使用Gumbel-Softmax进行可微的硬分配
+        # 每个专家（每一列）在所有群组中选择一个
+        # hard_assignment 的形状是 [max_groups, num_experts]
+        hard_assignment = F.gumbel_softmax(group_assignment_logits, tau=gumbel_tau, hard=hard, dim=0)
+        
+        # 计算每个群组的专家数量
+        group_sizes = hard_assignment.sum(dim=1)
+
+        # 1. 稀疏损失 (Sparsity Loss): 鼓励使用更少的群组
+        # 通过最大化组规模的L2范数平方来实现稀疏性。
+        # 我们希望最大化 torch.sum(group_sizes**2)，因此在损失函数中最小化它的相反数。
+        loss_sparsity = -torch.sum(group_sizes**2)
+
+        # 2. 平衡损失 (Balance Loss): 防止所有专家集中在极少数分组中
+        # 通过惩罚 group_sizes 的方差来鼓励更均衡的分布。
+        loss_balance = torch.var(group_sizes.float())
+
+        # 3. 正交损失 (Orthogonal Loss): 鼓励群组功能差异化
+        normalized_group_embeds = F.normalize(self.group_embeds.weight, p=2, dim=1)
+        ortho_matrix = normalized_group_embeds @ normalized_group_embeds.T
+        identity = torch.eye(self.max_groups, device=ortho_matrix.device)
+        loss_ortho = torch.mean((ortho_matrix - identity)**2)
+        
+        # 将三个结构损失加权相加
+        total_structure_loss = (self.sparsity_weight * loss_sparsity +
+                                self.balance_weight * loss_balance +
+                                self.ortho_weight * loss_ortho)
+        
+        return hard_assignment, group_sizes, total_structure_loss
+
+
+    def forward(self, hidden_states: torch.Tensor):
+        """
+        Args:
+            hidden_states (torch.Tensor): 输入张量，形状为 [batch_size, seq_len, hidden_size] 或 [N, hidden_size]。
+
+        Returns:
+            output (torch.Tensor): 与输入形状一致的输出张量。
+            l_aux (torch.Tensor): 从 gate 返回的辅助负载均衡损失。
+            exp_counts (torch.Tensor): 各专家激活 token 的统计信息。
+        """
+        orig_shape = hidden_states.shape
+        # 将输入展平成 [N, hidden_size]
+        x = hidden_states.view(-1, self.hidden_size)
+        N = x.size(0)
+
+        hard_assignment, group_sizes, loss_structure = self._get_group_assignment(hard=self.training)
+        
+        # 1. 专家路由：得到 l_aux, combine_weights, dispatch_mask, exp_counts
+        l_load_balance, combine_weights, dispatch_mask, self.group_counts = self.gate(
+            x, group_sizes=group_sizes
+        )
+        
+        combine_dense_groups = combine_weights.to(x.dtype).sum(dim=-1)
+        combine_dense = torch.matmul(combine_dense_groups, hard_assignment)
+
+        # 2. Fused 下投影：
+        # 从 embedding 中恢复 expert_down_weight，形状为 [num_experts, hidden_size, expert_dim]
+        expert_down_weight = self.expert_down.weight.view(self.num_experts, self.hidden_size, self.expert_dim)
+        # 将 expert_down_weight 转置并融合为 [hidden_size, num_experts * expert_dim]
+        fused_down = expert_down_weight.transpose(0, 1).reshape(self.hidden_size, self.num_experts * self.expert_dim)
+        # 对输入 x 做一次 dense 运算，获得中间输出：[N, num_experts * expert_dim]
+        intermediate_flat = x.matmul(fused_down)
+        # 变换形状到 [N, num_experts, expert_dim]
+        intermediate_all = intermediate_flat.view(N, self.num_experts, self.expert_dim)
+
+        # 3. 可选：专家内门控
+        if self.use_expert_gate:
+            # 从 embedding 中恢复 expert_gate_weight，形状为 [num_experts, hidden_size, expert_dim]
+            expert_gate_weight = self.expert_gate.weight.view(self.num_experts, self.hidden_size, self.expert_dim)
+            fused_gate = expert_gate_weight.transpose(0, 1).reshape(self.hidden_size, self.num_experts * self.expert_dim)
+            gate_flat = x.matmul(fused_gate)
+            gate_vals = gate_flat.view(N, self.num_experts, self.expert_dim)
+            intermediate_all = intermediate_all * self.activation(gate_vals)
+        else:
+            intermediate_all = self.dropout(self.activation(intermediate_all))
+
+        # 4. 上投影及加权求和：
+        # 从 embedding 中恢复 expert_up_weight，形状为 [num_experts, expert_dim, hidden_size]
+        expert_up_weight = self.expert_up.weight.view(self.num_experts, self.expert_dim, self.hidden_size)
+        # 计算公式：
+        #   output[n, h] = sum_{e, b} combine_dense[n, e] * intermediate_all[n, e, b] * expert_up_weight[e, b, h]
+        output = torch.einsum('ne, neb, ebh -> nh', combine_dense, intermediate_all, expert_up_weight)
+
+        # self.co_occurrence = self.count_expert_cooccurrence(combine_dense)
+        self.combine_dense = combine_dense
+        # ranked_pairs = self.compute_jaccard_scores(co_occurrence, exp_counts)
+        # print(f"Co-occurrence matrix: {co_occurrence}")
+        # print(f"Ranked pairs: {ranked_pairs[:3]}")
+        total_aux_loss = loss_structure + self.load_balance_weight * l_load_balance
+        self.exp_counts = torch.matmul(self.group_counts.float(), hard_assignment).round().long()
+
+        # 恢复原始形状（例如 [batch_size, seq_len, hidden_size]）
+        output = output.view(*orig_shape)
+        return output, total_aux_loss, self.exp_counts
 
 
 class MoEQwen2VLConfig(Qwen2VLConfig):
