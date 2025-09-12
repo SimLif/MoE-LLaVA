@@ -49,7 +49,97 @@ from moellava.train.callbacks import EpochBasedUnfreezeCallback
 from PIL import Image
 from moellava.utils import order_pick_k
 
+from transformers.integrations import WandbCallback
+from moellava.model.multimodal_model.qwen2_vl_moe import AdaptiveGroupingMoE
+
 local_rank = None
+
+
+class MoEWandbCallback(WandbCallback):
+    """
+    A custom WandbCallback that extracts and logs MoE-specific metrics.
+    """
+    def on_log(self, args, state, control, logs=None, model=None, **kwargs):
+        # We only need to modify the logs dict. The actual logging is handled by the parent.
+        if state.is_world_process_zero and model is not None and logs is not None and model.training:
+            
+            moe_layers_to_log = []
+            all_moe_layers_indices = []
+            
+            # Find all AdaptiveGroupingMoE layers and their indices
+            for name, module in model.named_modules():
+                if isinstance(module, AdaptiveGroupingMoE):
+                    try:
+                        layer_idx = int(name.split('.')[2])
+                        all_moe_layers_indices.append(layer_idx)
+                    except (ValueError, IndexError):
+                        continue
+            
+            if all_moe_layers_indices:
+                all_moe_layers_indices = sorted(list(set(all_moe_layers_indices)))
+                if len(all_moe_layers_indices) > 0:
+                    moe_layers_to_log.append(all_moe_layers_indices[0])
+                if len(all_moe_layers_indices) > 2:
+                    middle_idx = len(all_moe_layers_indices) // 2
+                    moe_layers_to_log.append(all_moe_layers_indices[middle_idx])
+                if len(all_moe_layers_indices) > 1:
+                    moe_layers_to_log.append(all_moe_layers_indices[-1])
+                
+                moe_layers_to_log = sorted(list(set(moe_layers_to_log)))
+
+                moe_metrics = {}
+                essential_metrics = [
+                    'l_load_balance', 'loss_sparsity', 'loss_balance', 'loss_ortho',
+                    'num_active_groups', 'group_size_std', 'group_size_max', 'group_size_entropy'
+                ]
+
+                for name, module in model.named_modules():
+                    if isinstance(module, AdaptiveGroupingMoE) and hasattr(module, 'last_metrics'):
+                        try:
+                            layer_idx = int(name.split('.')[2])
+                            if layer_idx not in moe_layers_to_log:
+                                continue
+                        except (ValueError, IndexError):
+                            continue
+
+                        for metric_name, value in module.last_metrics.items():
+                            if any(essential in metric_name for essential in essential_metrics):
+                                log_name = f"moe/layer_{layer_idx}/{metric_name}"
+                                moe_metrics[log_name] = value
+                        
+                        if 'num_active_groups' in module.last_metrics:
+                            num_active = module.last_metrics['num_active_groups']
+                            max_groups = module.max_groups
+                            ratio_log_name = f"moe/layer_{layer_idx}/active_groups_ratio"
+                            moe_metrics[ratio_log_name] = num_active / max_groups if max_groups > 0 else 0
+                        
+                        # Log weighted structural losses for direct impact analysis
+                        if 'loss_sparsity' in module.last_metrics:
+                            moe_metrics[f"moe/layer_{layer_idx}/weighted_loss_sparsity"] = module.last_metrics['loss_sparsity'] * module.sparsity_weight
+                        if 'loss_balance' in module.last_metrics:
+                            moe_metrics[f"moe/layer_{layer_idx}/weighted_loss_balance"] = module.last_metrics['loss_balance'] * module.balance_weight
+                        if 'loss_ortho' in module.last_metrics:
+                             moe_metrics[f"moe/layer_{layer_idx}/weighted_loss_ortho"] = module.last_metrics['loss_ortho'] * module.ortho_weight
+                        
+                        del module.last_metrics
+                
+                if hasattr(model, "last_task_loss") and hasattr(model, "last_aux_loss"):
+                    task_loss = model.last_task_loss
+                    aux_loss = model.last_aux_loss
+                    if task_loss > 0:
+                        moe_metrics["loss/task_aux_ratio"] = aux_loss / task_loss
+                    moe_metrics["loss/task_loss"] = task_loss
+                    moe_metrics["loss/aux_loss"] = aux_loss
+                    
+                    # Clean up attributes
+                    del model.last_task_loss
+                    del model.last_aux_loss
+
+                if moe_metrics:
+                    logs.update(moe_metrics)
+
+        # Let the parent class handle the actual logging to wandb
+        super().on_log(args, state, control, logs=logs, model=model, **kwargs)
 
 
 def rank0_print(*args):
@@ -1455,6 +1545,11 @@ def train():
                 new_state_dict[new_key] = value
             state_dict = new_state_dict
             # state_dict = {f'base_model.model.{k}': v for k, v in state_dict.items()}
+        if model_args.mone_expert_type == 'adaptive_grouping_expert':
+            # pop param, if 'wg' in k
+            for k in list(state_dict.keys()):
+                if 'wg' in k:
+                    state_dict.pop(k)
         incompatible = model.load_state_dict(state_dict, strict=False)
         if bool([k for k in incompatible.missing_keys if 'lora' not in k]):
             rank0_print("Missing keys:", incompatible.missing_keys)
@@ -1683,8 +1778,8 @@ def train():
             processing_class=processor,
             model=model,
             args=training_args,
-            **data_module
-        )
+            callbacks=[MoEWandbCallback()],
+            **data_module)
         if training_args.freeze_shared:
             trainer.add_callback(
                 EpochBasedUnfreezeCallback(unfreeze_shared_epoch=model_args.unfreeze_shared_epoch)

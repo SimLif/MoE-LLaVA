@@ -808,7 +808,7 @@ class TopKGateAdaptiveGrouping(torch.nn.Module):
             # input_fp32 = multiplicative_jitter(input_fp32, device=input.device)
             pass
         
-        logits = self.wg(input_fp32)
+        logits = torch.nn.functional.linear(input_fp32, weight=self.wg.weight.float(), bias=None)
 
         # ### MODIFICATION 5: 调用我们新的gating函数 ###
         gate_output = topkgating_adaptive_grouping(
@@ -1463,7 +1463,7 @@ class AdaptiveGroupingMoE(nn.Module):
 
         self.gate = TopKGateAdaptiveGrouping(
             model_dim=hidden_size,
-            num_experts=self.max_groups,
+            num_groups=self.max_groups,
             k=k,
             capacity_factor=capacity_factor,
             eval_capacity_factor=eval_capacity_factor,
@@ -1599,10 +1599,17 @@ class AdaptiveGroupingMoE(nn.Module):
         identity = torch.eye(self.max_groups, device=ortho_matrix.device)
         loss_ortho = torch.mean((ortho_matrix - identity)**2)
         
+        if self.training:
+            self.last_structure_loss_breakdown = {
+                'loss_sparsity': (self.sparsity_weight * loss_sparsity).item(),
+                'loss_balance': (self.balance_weight * loss_balance).item(),
+                'loss_ortho': (self.ortho_weight * loss_ortho).item(),
+            }
+        
         # 将三个结构损失加权相加
         total_structure_loss = (self.sparsity_weight * loss_sparsity +
-                                self.balance_weight * loss_balance +
-                                self.ortho_weight * loss_ortho)
+                               self.balance_weight * loss_balance +
+                               self.ortho_weight * loss_ortho)
         
         return hard_assignment, group_sizes, total_structure_loss
 
@@ -1666,7 +1673,31 @@ class AdaptiveGroupingMoE(nn.Module):
         # print(f"Co-occurrence matrix: {co_occurrence}")
         # print(f"Ranked pairs: {ranked_pairs[:3]}")
         total_aux_loss = loss_structure + self.load_balance_weight * l_load_balance
-        self.exp_counts = torch.matmul(self.group_counts.float(), hard_assignment).round().long()
+        self.exp_counts = torch.matmul(self.group_counts.to(hard_assignment.dtype), hard_assignment).round().long()
+
+        if self.training:
+            # Calculate entropy of group sizes for distribution analysis
+            active_group_sizes = group_sizes[group_sizes > 0].float()
+            if active_group_sizes.numel() > 0:
+                group_dist = active_group_sizes / active_group_sizes.sum()
+                group_size_entropy = -torch.sum(group_dist * torch.log(group_dist + 1e-9)).item()
+            else:
+                group_size_entropy = 0.0
+
+            self.last_metrics = {
+                "l_load_balance": (self.load_balance_weight * l_load_balance).item(),
+                "group_size_std": group_sizes.float().std().item(),
+                "group_size_max": group_sizes.float().max().item(),
+                "group_size_entropy": group_size_entropy,
+                "num_active_groups": (group_sizes > 0).sum().item(),
+                "exp_counts_mean": self.exp_counts.float().mean().item(),
+                "exp_counts_std": self.exp_counts.float().std().item(),
+                "group_counts_mean": self.group_counts.float().mean().item(),
+                "group_counts_std": self.group_counts.float().std().item(),
+            }
+            if hasattr(self, 'last_structure_loss_breakdown'):
+                self.last_metrics.update(self.last_structure_loss_breakdown)
+                del self.last_structure_loss_breakdown
 
         # 恢复原始形状（例如 [batch_size, seq_len, hidden_size]）
         output = output.view(*orig_shape)
@@ -2094,6 +2125,11 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                 moe_loss = self.router_aux_loss_coef * sum(moe_losses)
                 if (labels is not None):
                     # print(f"Loss: {loss}, MoE Loss: {sum(moe_losses)}, Total: {loss + moe_loss}")
+                    if self.training and moe_loss is not None:
+                        self.last_aux_loss = moe_loss.item()
+                        task_loss = loss.item() # loss here is before adding moe_loss
+                        self.last_task_loss = task_loss
+                    
                     if self.config.moe.get('kd_align', False):
                         loss = moe_loss + 0 * loss
                     else:
@@ -2136,6 +2172,11 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
             self.config.mone['mone_use_expert_gate'] = model_args.mone_use_expert_gate
             self.config.mone['mone_load_original'] = model_args.mone_load_original
             self.config.mone['mone_forward_mode'] = model_args.mone_forward_mode
+            self.config.mone['mone_max_groups'] = model_args.mone_max_groups
+            self.config.mone['mone_sparsity_weight'] = model_args.mone_sparsity_weight
+            self.config.mone['mone_ortho_weight'] = model_args.mone_ortho_weight
+            self.config.mone['mone_balance_weight'] = model_args.mone_balance_weight
+            self.config.mone['mone_load_balance_weight'] = model_args.mone_load_balance_weight
 
         self.config.moe['moe_enable'] = model_args.moe_enable
         self.config.moe['train_modules'] = model_args.train_modules
@@ -2264,6 +2305,23 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                         use_expert_gate=model_args.mone_use_expert_gate,
                         gate_type=model_args.mone_gate_type,
                         kd_align=model_args.kd_align,
+                    )
+                elif model_args.mone_expert_type == 'adaptive_grouping_expert':
+                    moe_layer = AdaptiveGroupingMoE(
+                        hidden_size=self.config.hidden_size,
+                        expert_dim=expert_dim,
+                        num_experts=num_experts,
+                        max_groups=model_args.mone_max_groups,
+                        sparsity_weight=model_args.mone_sparsity_weight,
+                        ortho_weight=model_args.mone_ortho_weight,
+                        balance_weight=model_args.mone_balance_weight,
+                        load_balance_weight=model_args.mone_load_balance_weight,
+                        k=model_args.top_k_experts,
+                        capacity_factor=model_args.capacity_factor,
+                        eval_capacity_factor=model_args.eval_capacity_factor,
+                        min_capacity=model_args.min_capacity,
+                        dropout=model_args.mone_dropout,
+                        use_expert_gate=model_args.mone_use_expert_gate,
                     )
                 else:
                     raise NotImplementedError(f"Unsupported expert type: {model_args.mone_expert_type}")

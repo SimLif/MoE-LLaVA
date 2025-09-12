@@ -63,6 +63,11 @@ class ModelArguments:
     mone_use_expert_gate: bool = False
     mone_load_original: bool = False
     mone_forward_mode: str = "batched"
+    mone_max_groups: int = 3
+    mone_sparsity_weight: float = 0.001
+    mone_ortho_weight: float = 1.0
+    mone_balance_weight: float = 0.01
+    mone_load_balance_weight: float = 0.01
     unfreeze_shared_epoch: int = 1
     use_combined_gate: bool = False
     combined_gate_type: str = 'ds'

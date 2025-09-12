@@ -25,6 +25,7 @@ from peft import PeftModel
 from transformers.modeling_utils import PreTrainedModel
 from transformers.trainer import _is_peft_model, speed_metrics
 from transformers.trainer import *
+from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 def maybe_zero_3(param, ignore_status=False, name=None):
     from deepspeed import zero
