@@ -728,8 +728,10 @@ def topkgating_adaptive_grouping(
             # 计算每个群组的容量向量 [num_groups]
             capacity = (group_sizes * tokens_per_expert_avg * capacity_factor)
         else:
-            capacity = torch.zeros_like(group_sizes)
+            capacity = torch.zeros_like(group_sizes, dtype=torch.float32)
 
+        # Ensure that any non-zero capacity is at least 1 before clamping.
+        capacity = torch.ceil(capacity)
         capacity = torch.clamp(capacity, min=min_capacity).long()
         # --- END MODIFICATION ---
 
@@ -1579,10 +1581,20 @@ class AdaptiveGroupingMoE(nn.Module):
         # 使用Gumbel-Softmax进行可微的硬分配
         # 每个专家（每一列）在所有群组中选择一个
         # hard_assignment 的形状是 [max_groups, num_experts]
-        hard_assignment = F.gumbel_softmax(group_assignment_logits, tau=gumbel_tau, hard=hard, dim=0)
+        if self.training:
+            # Use Gumbel-Softmax for differentiable hard assignment during training
+            hard_assignment = F.gumbel_softmax(group_assignment_logits, tau=gumbel_tau, hard=hard, dim=0)
+        else:
+            # Use deterministic argmax for evaluation
+            expert_to_group_idx = torch.argmax(group_assignment_logits, dim=0)
+            hard_assignment = F.one_hot(expert_to_group_idx, num_classes=self.max_groups).to(group_assignment_logits.dtype).T
         
         # 计算每个群组的专家数量
         group_sizes = hard_assignment.sum(dim=1)
+
+        if not self.training:
+            # During eval, we don't need to compute loss
+            return hard_assignment, group_sizes, torch.tensor(0.0, device=group_assignment_logits.device)
 
         # 1. 稀疏损失 (Sparsity Loss): 鼓励使用更少的群组
         # 通过最大化组规模的L2范数平方来实现稀疏性。
@@ -2555,6 +2567,24 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
                         use_expert_gate=self.config.mone.get('mone_use_expert_gate', False),
                         gate_type=self.config.mone.get('mone_gate_type', 'token_gating'),
                         expert_cluster_mask_list=expert_cluster_mask_list
+                    )
+                elif mone_expert_type == 'adaptive_grouping_expert':
+                    moe_layer = AdaptiveGroupingMoE(
+                        hidden_size=self.config.hidden_size,
+                        expert_dim=mone_r, # This comes from self.config.mone
+                        num_experts=num_experts,
+                        max_groups=self.config.mone.get('mone_max_groups'),
+                        sparsity_weight=self.config.mone.get('mone_sparsity_weight'),
+                        ortho_weight=self.config.mone.get('mone_ortho_weight'),
+                        balance_weight=self.config.mone.get('mone_balance_weight'),
+                        load_balance_weight=self.config.mone.get('mone_load_balance_weight'),
+                        k=self.config.moe.get('top_k_experts'),
+                        capacity_factor=self.config.moe.get('capacity_factor'),
+                        eval_capacity_factor=self.config.moe.get('eval_capacity_factor'),
+                        min_capacity=self.config.moe.get('min_capacity'),
+                        dropout=self.config.mone.get('mone_dropout', 0.0),
+                        activation=self.config.mone.get('mone_act_fn', 'silu'),
+                        use_expert_gate=self.config.mone.get('mone_use_expert_gate', False),
                     )
                 else:
                     raise NotImplementedError(f"Unsupported expert type: {mone_expert_type}")
