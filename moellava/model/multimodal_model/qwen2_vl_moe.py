@@ -114,7 +114,7 @@ class SmallExpert(nn.Module):
 # 定义组合层，结合原始MLP和MoE
 class CombinedLayer(nn.Module):
     def __init__(self, shared, moe, use_gate=False, gate_type='ds',
-                 gate_dropout=0.0, hidden_size=0, cmr_target=0.8, structure='new', kd_align=False):
+                 gate_dropout=0.0, hidden_size=0, cmr_target=0.8, structure='new', kd_align=False, shared_dropout_prob=0.0):
         """
         Args:
             shared: 共享的 MLP（或 FFN）模块
@@ -126,6 +126,7 @@ class CombinedLayer(nn.Module):
                           用以强制部分 tokens 仅走共享分支
             hidden_size: 输入的隐藏层尺寸，用于构造 gate 层
             cmr_target: 对于 cmr gate，预算约束的目标概率值 (例如 0.8 表示希望 MoE 分支占 80%)
+            shared_dropout_prob: 共享专家输出的dropout概率
         """
         super().__init__()
         self.structure = structure
@@ -140,6 +141,7 @@ class CombinedLayer(nn.Module):
         self.gate_dropout = gate_dropout
         self.cmr_target = cmr_target
         self.kd_align = kd_align
+        self.shared_dropout = nn.Dropout(p=shared_dropout_prob)
         
         if use_gate:
             if self.gate_type == 'ds':
@@ -162,9 +164,11 @@ class CombinedLayer(nn.Module):
         # 先分别计算共享层和 MoE 层的输出
         if self.structure == 'new':
             mlp_out = self.shared(x)
+            mlp_out = self.shared_dropout(mlp_out)
             moe_out = self.moe(x)
         elif self.structure == 'old':
             mlp_out = self.original_mlp(x)
+            mlp_out = self.shared_dropout(mlp_out)
             moe_out = self.moe_layer(x)
         
         # 处理 MoE 层可能返回 (output, aux_loss) 的情况
@@ -673,7 +677,7 @@ def topkgating_adaptive_grouping(
     drop_tokens: bool = True,
     ep_group: Union[torch.distributed.ProcessGroup, None] = None,
     drop_policy: str = "position",
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """
     Implements TopKGating with adaptive grouping enhancements.
     - Load balancing loss is proportional to group size.
@@ -684,6 +688,12 @@ def topkgating_adaptive_grouping(
     gates = F.softmax(logits, dim=1)
     num_tokens, num_groups = gates.shape[0], gates.shape[1]
 
+    # --- Guidance Loss Calculation ---
+    # Penalize routing probability mass assigned to empty groups.
+    is_empty_mask = (group_sizes == 0)
+    illegal_probs = gates * is_empty_mask.to(gates.dtype)
+    l_guidance = torch.mean(torch.sum(illegal_probs, dim=1))
+    
     # get topk gates
     top_gate, top_idx = torch.topk(logits, k=k, dim=1)
 
@@ -693,12 +703,14 @@ def topkgating_adaptive_grouping(
 
     # ### MODIFICATION 2: 替换 l_aux 计算 ###
     # --- START MODIFICATION ---
-    # 计算加权的负载均衡损失 (KL散度)
+    # 计算加权的负载均衡损失 (KL散度)。
     if torch.sum(group_sizes) > 0:
         # 目标分布：与群组规模成正比
         target_distribution = group_sizes.float() / torch.sum(group_sizes)
-        # 实际分布：每个群组接收到的token比例
-        actual_distribution = exp_counts / num_tokens
+        
+        # 实际分布：使用 soft gates (probabilities) 来计算每个组接收到的 "软" token比例。
+        soft_exp_counts = torch.sum(gates, dim=0)
+        actual_distribution = soft_exp_counts / num_tokens
         
         # 使用KL散度计算损失
         l_aux = F.kl_div(
@@ -761,7 +773,7 @@ def topkgating_adaptive_grouping(
     combine_weights = torch.einsum("se,sec->sec", gates_masked, locations_sc)
     dispatch_mask = combine_weights.bool()
 
-    return l_aux, combine_weights, dispatch_mask, exp_counts
+    return l_aux, l_guidance, combine_weights, dispatch_mask, exp_counts
 
 
 class TopKGateAdaptiveGrouping(torch.nn.Module):
@@ -780,7 +792,9 @@ class TopKGateAdaptiveGrouping(torch.nn.Module):
                  min_capacity: int = 8,
                  noisy_gate_policy: Optional[str] = None,
                  drop_tokens: bool = True,
-                 drop_policy: str = "position") -> None:
+                 drop_policy: str = "position",
+                 guidance_loss_weight: float = 0.01, # Add guidance loss weight
+                 **kwargs):
         super().__init__()
 
         # wg现在路由到群组，而不是专家
@@ -792,6 +806,7 @@ class TopKGateAdaptiveGrouping(torch.nn.Module):
         self.noisy_gate_policy = noisy_gate_policy
         self.drop_tokens = drop_tokens
         self.drop_policy = drop_policy
+        self.guidance_loss_weight = guidance_loss_weight
         
         # 确保使用推荐的丢弃策略
         if self.drop_tokens and self.drop_policy != "position":
@@ -802,7 +817,7 @@ class TopKGateAdaptiveGrouping(torch.nn.Module):
     def forward(self,
                 input: torch.Tensor,
                 group_sizes: torch.Tensor, # ### MODIFICATION 4: forward方法接收group_sizes ###
-                ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+                ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
 
         input_fp32 = input.float()
         if self.noisy_gate_policy == 'Jitter' and self.training:
@@ -1426,6 +1441,8 @@ class AdaptiveGroupingMoE(nn.Module):
         ortho_weight: float,
         balance_weight: float,
         load_balance_weight: float,
+        use_separation_loss: bool,
+        separation_loss_weight: float,
         k: int,
         capacity_factor: float = 1.0,
         eval_capacity_factor: float = 1.0,
@@ -1433,6 +1450,10 @@ class AdaptiveGroupingMoE(nn.Module):
         dropout: float = 0.0,
         activation: str = "silu",
         use_expert_gate: bool = False,
+        separation_loss_lambda: float = 1.0,
+        initial_gumbel_tau: float = 2.0,
+        guidance_loss_weight: float = 0.01, # Add guidance loss weight
+        **kwargs,
     ):
         """
         Args:
@@ -1460,8 +1481,13 @@ class AdaptiveGroupingMoE(nn.Module):
         self.ortho_weight = ortho_weight
         self.balance_weight = balance_weight
         self.load_balance_weight = load_balance_weight
+        self.use_separation_loss = use_separation_loss
+        self.separation_loss_weight = separation_loss_weight
         self.k = k
         self.use_expert_gate = use_expert_gate
+        self.separation_loss_lambda = separation_loss_lambda
+        self.gumbel_tau = initial_gumbel_tau
+        self.guidance_loss_weight = guidance_loss_weight
 
         self.gate = TopKGateAdaptiveGrouping(
             model_dim=hidden_size,
@@ -1471,6 +1497,8 @@ class AdaptiveGroupingMoE(nn.Module):
             eval_capacity_factor=eval_capacity_factor,
             min_capacity=min_capacity,
             drop_tokens=True,
+            drop_policy=kwargs.get('drop_policy', "position"),
+            guidance_loss_weight=guidance_loss_weight,
         )
 
         self.dropout = nn.Dropout(dropout)
@@ -1489,7 +1517,20 @@ class AdaptiveGroupingMoE(nn.Module):
         self.expert_embeds = nn.Embedding(num_experts, hidden_size)
         self.group_embeds = nn.Embedding(self.max_groups, hidden_size)
         nn.init.normal_(self.expert_embeds.weight, std=math.sqrt(2.0 / hidden_size))
-        nn.init.normal_(self.group_embeds.weight, std=math.sqrt(2.0 / hidden_size))
+        
+        # --- Key Change: Apply orthogonal initialization to group_embeds to break initial symmetry ---
+        if self.max_groups <= hidden_size:
+            torch.nn.init.orthogonal_(self.group_embeds.weight)
+            print("Applied orthogonal initialization to group_embeds.")
+        else:
+            # Fallback for when orthogonality is not mathematically possible
+            torch.nn.init.kaiming_uniform_(self.group_embeds.weight, a=math.sqrt(5))
+            print(f"Warning: max_groups ({self.max_groups}) > hidden_size ({hidden_size}). "
+                  f"Used Kaiming init for group_embeds instead of orthogonal.")
+
+        # Add LayerNorm for stability
+        self.group_embed_norm = nn.LayerNorm(hidden_size)
+        self.expert_embed_norm = nn.LayerNorm(hidden_size)
 
         # 用 nn.Embedding 存储下投影参数，每个专家的参数 shape: [hidden_size * expert_dim]
         self.expert_down = nn.Embedding(num_experts, hidden_size * expert_dim)
@@ -1565,25 +1606,28 @@ class AdaptiveGroupingMoE(nn.Module):
         return ranked_pairs
     
 
-    def _get_group_assignment(self, gumbel_tau=1.0, hard=True):
+    def _get_group_assignment(self):
         """
         计算专家到群组的分配，并返回分配矩阵及结构损失。
         
         Returns:
             hard_assignment (torch.Tensor): 硬分配矩阵，形状为 [max_groups, num_experts]。
+            group_sizes (torch.Tensor): 每个群组的专家数量。
             total_structure_loss (torch.Tensor): 汇总的结构损失（稀疏性 + 正交性）。
         """
         
         # 假设 self.group_embeds 和 self.expert_embeds 是 nn.Embedding 层
         # 亲和度矩阵 [max_groups, num_experts]
-        group_assignment_logits = self.group_embeds.weight @ self.expert_embeds.weight.T
+        group_embeds_w = self.group_embed_norm(self.group_embeds.weight)
+        expert_embeds_w = self.expert_embed_norm(self.expert_embeds.weight)
+        group_assignment_logits = group_embeds_w @ expert_embeds_w.T
         
         # 使用Gumbel-Softmax进行可微的硬分配
         # 每个专家（每一列）在所有群组中选择一个
         # hard_assignment 的形状是 [max_groups, num_experts]
         if self.training:
             # Use Gumbel-Softmax for differentiable hard assignment during training
-            hard_assignment = F.gumbel_softmax(group_assignment_logits, tau=gumbel_tau, hard=hard, dim=0)
+            hard_assignment = F.gumbel_softmax(group_assignment_logits, tau=self.gumbel_tau, hard=True, dim=0)
         else:
             # Use deterministic argmax for evaluation
             expert_to_group_idx = torch.argmax(group_assignment_logits, dim=0)
@@ -1606,24 +1650,119 @@ class AdaptiveGroupingMoE(nn.Module):
         loss_balance = torch.var(group_sizes.float())
 
         # 3. 正交损失 (Orthogonal Loss): 鼓励群组功能差异化
-        normalized_group_embeds = F.normalize(self.group_embeds.weight, p=2, dim=1)
+        normalized_group_embeds = F.normalize(group_embeds_w, p=2, dim=1)
         ortho_matrix = normalized_group_embeds @ normalized_group_embeds.T
         identity = torch.eye(self.max_groups, device=ortho_matrix.device)
         loss_ortho = torch.mean((ortho_matrix - identity)**2)
         
         if self.training:
             self.last_structure_loss_breakdown = {
-                'loss_sparsity': (self.sparsity_weight * loss_sparsity).item(),
-                'loss_balance': (self.balance_weight * loss_balance).item(),
-                'loss_ortho': (self.ortho_weight * loss_ortho).item(),
+                'loss_sparsity': loss_sparsity.item(),
+                'loss_balance': loss_balance.item(),
+                'loss_ortho': loss_ortho.item(),
+                'weighted_loss_sparsity': (self.sparsity_weight * loss_sparsity).item(),
+                'weighted_loss_balance': (self.balance_weight * loss_balance).item(),
+                'weighted_loss_ortho': (self.ortho_weight * loss_ortho).item(),
             }
         
         # 将三个结构损失加权相加
         total_structure_loss = (self.sparsity_weight * loss_sparsity +
                                self.balance_weight * loss_balance +
                                self.ortho_weight * loss_ortho)
-        
+
         return hard_assignment, group_sizes, total_structure_loss
+
+
+    def compute_separation_loss(self, all_expert_weights, hard_assignment, eps=1e-6):
+        """
+        计算分离损失，目标是"组内高内聚，组间低耦合"。
+
+        Args:
+            all_expert_weights (Tensor): 所有专家的组合权重，形状为 [num_experts, expert_dim]。
+            hard_assignment (Tensor): 硬分配矩阵，形状为 [num_groups, num_experts]。
+            eps (float): 用于防止除以零的小常数。
+
+        Returns:
+            loss_separation (Tensor): 计算出的分离损失标量。
+        """
+        num_groups, num_experts = hard_assignment.shape
+        expert_dim = all_expert_weights.shape[1]
+
+        # --- 向量化计算所有组的质心 ---
+        # hard_assignment: [G, E], all_expert_weights: [E, D] -> summed_weights: [G, D]
+        # 这一步代替了 for 循环中的权重筛选和求和
+        summed_weights = torch.matmul(hard_assignment, all_expert_weights)
+        
+        # 计算每个组的专家数量
+        group_expert_counts = hard_assignment.sum(dim=1)  # Shape: [G]
+        
+        # 计算质心，使用 eps 防止除以零
+        # unsqueeze(1) 将 group_expert_counts 变为 [G, 1] 以进行广播
+        centroids = summed_weights / (group_expert_counts.unsqueeze(1) + eps)
+
+        # --- 1. 向量化计算组内聚合损失 (Intra-group Cohesion Loss) ---
+        # hard_assignment.t(): [E, G], centroids: [G, D] -> expert_centroids: [E, D]
+        # 这一步为每个专家找到了其所属组的质心
+        expert_centroids = torch.matmul(hard_assignment.t(), centroids)
+
+        # 计算每个专家与其组质心的余弦相似度
+        # all_expert_weights: [E, D], expert_centroids: [E, D] -> cos_sim_intra: [E]
+        cos_sim_intra = F.cosine_similarity(all_expert_weights, expert_centroids, dim=1)
+        
+        # 损失是 1 - 相似度
+        intra_losses = 1 - cos_sim_intra
+        
+        # 计算每个组的平均损失
+        # hard_assignment: [G, E], intra_losses.unsqueeze(0): [1, E] -> summed_intra_loss: [G]
+        summed_intra_loss = torch.matmul(hard_assignment, intra_losses.unsqueeze(1)).squeeze(1)
+        
+        # 仅对包含多于一个专家的组计算损失
+        multi_expert_groups_mask = group_expert_counts > 1
+        
+        if multi_expert_groups_mask.sum() > 0:
+            # 使用掩码来安全地计算平均值
+            avg_intra_loss_per_group = summed_intra_loss / (group_expert_counts + eps)
+            loss_intra = avg_intra_loss_per_group[multi_expert_groups_mask].mean()
+        else:
+            loss_intra = torch.tensor(0.0, device=all_expert_weights.device)
+
+        # --- 2. 向量化计算组间分离损失 (Inter-group Separation Loss) ---
+        active_groups_mask = group_expert_counts > 0
+        num_active_groups = active_groups_mask.sum()
+
+        loss_inter = torch.tensor(0.0, device=all_expert_weights.device)
+        if num_active_groups >= 2:
+            active_centroids = centroids[active_groups_mask]
+            
+            # --- Performance Optimization: Pad G to a multiple of 8 ---
+            # Modern GPUs (cuBLAS GEMM) are highly optimized for matrix dimensions that are multiples of 8.
+            # An awkward dimension like 9 can cause a fallback to a much slower kernel.
+            # We pad to the nearest multiple of 8 to ensure we hit the fast path.
+            G = num_active_groups
+            PADDED_G = (G + 7) & -8 # Bitwise trick to round up to the nearest multiple of 8
+            
+            if G != PADDED_G:
+                padding = torch.zeros(PADDED_G - G, active_centroids.shape[1], 
+                                      device=active_centroids.device, 
+                                      dtype=active_centroids.dtype)
+                padded_centroids = torch.cat([active_centroids, padding], dim=0)
+            else:
+                padded_centroids = active_centroids
+
+            normalized_centroids = F.normalize(padded_centroids, p=2, dim=1)
+            # Perform the expensive matmul on the padded, performance-friendly matrix
+            cosine_matrix_padded = torch.matmul(normalized_centroids, normalized_centroids.t())
+            
+            # Slice the result back to the original size before computing the loss
+            cosine_matrix = cosine_matrix_padded[:G, :G]
+            
+            triu_indices = torch.triu_indices(G, G, offset=1, device=cosine_matrix.device)
+            loss_inter = torch.abs(cosine_matrix[triu_indices[0], triu_indices[1]]).mean()
+
+        # --- 3. 合并损失 ---
+        loss_separation = loss_intra + self.separation_loss_lambda * loss_inter
+        
+        return loss_separation, loss_intra, loss_inter
 
 
     def forward(self, hidden_states: torch.Tensor):
@@ -1641,11 +1780,11 @@ class AdaptiveGroupingMoE(nn.Module):
         x = hidden_states.view(-1, self.hidden_size)
         N = x.size(0)
 
-        hard_assignment, group_sizes, loss_structure = self._get_group_assignment(hard=self.training)
+        hard_assignment, group_sizes, loss_structure = self._get_group_assignment()
         
         # 1. 专家路由：得到 l_aux, combine_weights, dispatch_mask, exp_counts
-        l_load_balance, combine_weights, dispatch_mask, self.group_counts = self.gate(
-            x, group_sizes=group_sizes
+        l_load_balance, l_guidance, combine_weights, dispatch_mask, self.group_counts = self.gate(
+            x, group_sizes=group_sizes.detach()
         )
         
         combine_dense_groups = combine_weights.to(x.dtype).sum(dim=-1)
@@ -1684,33 +1823,67 @@ class AdaptiveGroupingMoE(nn.Module):
         # ranked_pairs = self.compute_jaccard_scores(co_occurrence, exp_counts)
         # print(f"Co-occurrence matrix: {co_occurrence}")
         # print(f"Ranked pairs: {ranked_pairs[:3]}")
-        total_aux_loss = loss_structure + self.load_balance_weight * l_load_balance
+        total_aux_loss = loss_structure + self.load_balance_weight * l_load_balance + self.guidance_loss_weight * l_guidance
+
+        if self.training and self.use_separation_loss:
+            # Normalize each component before concatenation for a more stable "functional signature"
+            w_down_norm = F.normalize(self.expert_down.weight, p=2, dim=1)
+            w_up_norm = F.normalize(self.expert_up.weight, p=2, dim=1)
+            
+            expert_weights_list = [w_down_norm, w_up_norm]
+            if self.use_expert_gate:
+                w_gate_norm = F.normalize(self.expert_gate.weight, p=2, dim=1)
+                expert_weights_list.append(w_gate_norm)
+
+            all_expert_weights = torch.cat(expert_weights_list, dim=1)
+            loss_separation, loss_intra, loss_inter = self.compute_separation_loss(all_expert_weights, hard_assignment)
+
+            total_aux_loss += self.separation_loss_weight * loss_separation
+
+        # --- Enhanced Metrics for Observability ---
+        # Calculate expert counts based on group counts and the current hard assignment
         self.exp_counts = torch.matmul(self.group_counts.to(hard_assignment.dtype), hard_assignment).round().long()
 
         if self.training:
-            # Calculate entropy of group sizes for distribution analysis
-            active_group_sizes = group_sizes[group_sizes > 0].float()
-            if active_group_sizes.numel() > 0:
-                group_dist = active_group_sizes / active_group_sizes.sum()
-                group_size_entropy = -torch.sum(group_dist * torch.log(group_dist + 1e-9)).item()
-            else:
-                group_size_entropy = 0.0
+            # --- Enhanced Metrics for Observability ---
+            def entropy(counts):
+                # Calculate entropy for a tensor of counts
+                if counts.sum() == 0:
+                    return 0.0
+                probs = counts.float() / counts.sum()
+                return -torch.sum(probs * torch.log(probs + 1e-9)).item()
+
+            # Dynamic routing metrics from group_counts (output of the gate)
+            active_group_mask = group_sizes > 0
+            empty_group_mask = ~active_group_mask
+            
+            tokens_to_empty_groups = self.group_counts[empty_group_mask].sum().item()
+            total_tokens = self.group_counts.sum().item()
+            empty_group_activation_rate = tokens_to_empty_groups / (total_tokens + 1e-9)
 
             self.last_metrics = {
-                "l_load_balance": (self.load_balance_weight * l_load_balance).item(),
+                "l_load_balance": l_load_balance.item(),
+                "weighted_l_load_balance": (self.load_balance_weight * l_load_balance).item(),
+                # Static structure metrics
                 "group_size_std": group_sizes.float().std().item(),
                 "group_size_max": group_sizes.float().max().item(),
-                "group_size_entropy": group_size_entropy,
-                "num_active_groups": (group_sizes > 0).sum().item(),
-                "exp_counts_mean": self.exp_counts.float().mean().item(),
-                "exp_counts_std": self.exp_counts.float().std().item(),
-                "group_counts_mean": self.group_counts.float().mean().item(),
-                "group_counts_std": self.group_counts.float().std().item(),
+                "num_active_groups": active_group_mask.sum().item(),
+                # Dynamic activation metrics
+                "group_activation_entropy": entropy(self.group_counts),
+                "expert_activation_entropy": entropy(self.exp_counts),
+                "empty_group_activation_rate": empty_group_activation_rate,
+                "expert_utilization": (self.exp_counts > 0).sum().item() / self.num_experts if self.num_experts > 0 else 0.0,
+                "guidance_loss": l_guidance.item(),
+                "weighted_guidance_loss": (l_guidance * self.guidance_loss_weight).item(),
             }
             if hasattr(self, 'last_structure_loss_breakdown'):
                 self.last_metrics.update(self.last_structure_loss_breakdown)
                 del self.last_structure_loss_breakdown
-
+            if self.use_separation_loss:
+                self.last_metrics['loss_separation'] = loss_separation.item()
+                self.last_metrics['weighted_loss_separation'] = (loss_separation * self.separation_loss_weight).item()
+                self.last_metrics['loss_intra'] = loss_intra.item()
+                self.last_metrics['loss_inter'] = loss_inter.item()
         # 恢复原始形状（例如 [batch_size, seq_len, hidden_size]）
         output = output.view(*orig_shape)
         return output, total_aux_loss, self.exp_counts
@@ -2189,6 +2362,10 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
             self.config.mone['mone_ortho_weight'] = model_args.mone_ortho_weight
             self.config.mone['mone_balance_weight'] = model_args.mone_balance_weight
             self.config.mone['mone_load_balance_weight'] = model_args.mone_load_balance_weight
+            self.config.mone['use_separation_loss'] = model_args.use_separation_loss
+            self.config.mone['separation_loss_weight'] = model_args.separation_loss_weight
+            self.config.mone['separation_loss_lambda'] = model_args.separation_loss_lambda
+            self.config.mone['initial_gumbel_tau'] = model_args.initial_gumbel_tau
 
         self.config.moe['moe_enable'] = model_args.moe_enable
         self.config.moe['train_modules'] = model_args.train_modules
@@ -2207,6 +2384,7 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
         self.config.moe['combined_gate_type'] = model_args.combined_gate_type
         self.config.moe['combined_gate_drop'] = model_args.combined_gate_drop
         self.config.moe['kd_align'] = model_args.kd_align
+        self.config.moe['shared_dropout_prob'] = model_args.initial_shared_dropout_prob
         
         # Freeze all parameters except those specified in train_modules
         if self.config.moe['train_modules'] is not None and len(self.config.moe['train_modules']) > 0:
@@ -2328,12 +2506,17 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                         ortho_weight=model_args.mone_ortho_weight,
                         balance_weight=model_args.mone_balance_weight,
                         load_balance_weight=model_args.mone_load_balance_weight,
+                        use_separation_loss=model_args.use_separation_loss,
+                        separation_loss_weight=model_args.separation_loss_weight,
                         k=model_args.top_k_experts,
                         capacity_factor=model_args.capacity_factor,
                         eval_capacity_factor=model_args.eval_capacity_factor,
                         min_capacity=model_args.min_capacity,
                         dropout=model_args.mone_dropout,
                         use_expert_gate=model_args.mone_use_expert_gate,
+                        separation_loss_lambda=model_args.separation_loss_lambda,
+                        initial_gumbel_tau=model_args.initial_gumbel_tau,
+                        guidance_loss_weight=model_args.guidance_loss_weight,
                     )
                 else:
                     raise NotImplementedError(f"Unsupported expert type: {model_args.mone_expert_type}")
@@ -2449,6 +2632,7 @@ class MoEQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                     self.config.moe['combined_gate_drop'],
                     self.config.hidden_size,
                     kd_align=self.config.moe['kd_align'],
+                    shared_dropout_prob=self.config.moe.get('shared_dropout_prob', 0.0),
                 )
             self.model.layers[layer_num].mlp = moe_layer
 
@@ -2578,6 +2762,8 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
                         ortho_weight=self.config.mone.get('mone_ortho_weight'),
                         balance_weight=self.config.mone.get('mone_balance_weight'),
                         load_balance_weight=self.config.mone.get('mone_load_balance_weight'),
+                        use_separation_loss=self.config.mone.get('use_separation_loss'),
+                        separation_loss_weight=self.config.mone.get('separation_loss_weight'),
                         k=self.config.moe.get('top_k_experts'),
                         capacity_factor=self.config.moe.get('capacity_factor'),
                         eval_capacity_factor=self.config.moe.get('eval_capacity_factor'),
@@ -2585,6 +2771,9 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
                         dropout=self.config.mone.get('mone_dropout', 0.0),
                         activation=self.config.mone.get('mone_act_fn', 'silu'),
                         use_expert_gate=self.config.mone.get('mone_use_expert_gate', False),
+                        separation_loss_lambda=self.config.mone.get('separation_loss_lambda', 1.0),
+                        initial_gumbel_tau=self.config.mone.get('initial_gumbel_tau', 2.0),
+                        guidance_loss_weight=self.config.mone.get('guidance_loss_weight', 0.01),
                     )
                 else:
                     raise NotImplementedError(f"Unsupported expert type: {mone_expert_type}")
@@ -2614,6 +2803,7 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
                     self.config.moe.get('combined_gate_drop', False),
                     self.config.hidden_size,
                     structure=self.config.moe.get('structure', 'new'),
+                    shared_dropout_prob=self.config.moe.get('shared_dropout_prob', 0.0),
                 )
             self.model.layers[layer_num].mlp = moe_layer
 

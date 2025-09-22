@@ -68,6 +68,30 @@ class ModelArguments:
     mone_ortho_weight: float = 1.0
     mone_balance_weight: float = 0.01
     mone_load_balance_weight: float = 0.01
+    use_annealing: bool = field(default=False, metadata={"help": "Enable annealing for structural loss weights."})
+    # New parameters for advanced grouping strategies
+    use_separation_loss: bool = field(default=False, metadata={"help": "Enable separation loss to penalize co-occurrence of experts in different groups."})
+    separation_loss_weight: float = field(default=0.1, metadata={"help": "Weight for the separation loss."})
+    final_separation_loss_weight: float = field(default=None, metadata={"help": "Final separation loss weight for annealing. If None, this weight is not annealed."})
+    separation_loss_lambda: float = field(default=1.0, metadata={"help": "lambda for separation loss"})
+    use_gumbel_tau_annealing: bool = field(default=False, metadata={"help": "Enable Gumbel-Softmax temperature annealing."})
+    initial_gumbel_tau: float = field(default=2.0, metadata={"help": "Initial temperature for Gumbel-Softmax."})
+    final_gumbel_tau: float = field(default=0.5, metadata={"help": "Final temperature for Gumbel-Softmax."})
+
+    # Shared expert specific parameters
+    use_shared_dropout_annealing: bool = field(default=False, metadata={"help": "Enable dropout annealing for the shared expert."})
+    initial_shared_dropout_prob: float = field(default=0.25, metadata={"help": "Initial dropout probability for the shared expert."})
+    final_shared_dropout_prob: float = field(default=0.0, metadata={"help": "Final dropout probability for the shared expert."})
+
+    guidance_loss_weight: float = field(default=0.01, metadata={"help": "Weight for the guidance loss to penalize routing to empty groups."})
+    regularizer_warmup_proportion: float = field(default=0.2, metadata={"help": "Proportion of training to keep regularizer losses at zero before annealing up."})
+    
+    use_guidance_pulse_schedule: bool = field(default=True, metadata={"help": "Whether to use a pulse-like annealing schedule for guidance loss."})
+    guidance_peak_proportion: float = field(default=0.5, metadata={"help": "The training progress proportion at which guidance loss weight reaches its peak."})
+    guidance_end_proportion: float = field(default=1.0, metadata={"help": "The training progress proportion at which guidance loss weight decays back to zero."})
+
+    initial_load_balance_weight: float = field(default=0.01, metadata={"help": "Initial value for the load balance weight, which will anneal up to the target value."})
+
     unfreeze_shared_epoch: int = 1
     use_combined_gate: bool = False
     combined_gate_type: str = 'ds'

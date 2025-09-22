@@ -36,7 +36,7 @@ from moellava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TO
     DEFAULT_IM_END_TOKEN, DEFAULT_VIDEO_TOKEN, DEFAULT_VID_START_TOKEN, DEFAULT_VID_END_TOKEN, MAX_IMAGE_LENGTH, \
     MAX_VIDEO_LENGTH
 from torch.utils.data import Dataset
-from moellava.train.llava_trainer import LLaVATrainer, QwenMoETrainer
+from moellava.train.llava_trainer import LLaVATrainer, QwenMoETrainer, DebuggingTrainer
 
 from moellava import conversation as conversation_lib
 from moellava.model import *
@@ -50,9 +50,279 @@ from PIL import Image
 from moellava.utils import order_pick_k
 
 from transformers.integrations import WandbCallback
-from moellava.model.multimodal_model.qwen2_vl_moe import AdaptiveGroupingMoE
+from moellava.model.multimodal_model.qwen2_vl_moe import AdaptiveGroupingMoE, CombinedLayer
+import math
+from transformers import TrainerCallback
+
 
 local_rank = None
+
+def rank0_print(*args):
+    if local_rank == 0:
+        print(*args)
+
+
+class GumbelTauAnnealingCallback(TrainerCallback):
+    """
+    A callback to anneal the Gumbel-Softmax temperature (tau) for AdaptiveGroupingMoE layers.
+    """
+    def __init__(self, initial_tau=2.0, final_tau=0.5, use_cosine_schedule=True):
+        self.initial_tau = initial_tau
+        self.final_tau = final_tau
+        self.use_cosine_schedule = use_cosine_schedule
+        self._moe_modules = []
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if model is None:
+            return
+        
+        # Find all AdaptiveGroupingMoE modules
+        for module in model.modules():
+            if isinstance(module, AdaptiveGroupingMoE):
+                self._moe_modules.append(module)
+        
+        if self._moe_modules:
+            rank0_print(f"Gumbel-Softmax temperature will be annealed from {self.initial_tau} to {self.final_tau}.")
+        else:
+            rank0_print("GumbelTauAnnealingCallback: No AdaptiveGroupingMoE modules found. This callback will do nothing.")
+
+    def on_step_begin(self, args, state, control, model=None, **kwargs):
+        if not self._moe_modules or state.max_steps <= 0:
+            return
+
+        progress = state.global_step / state.max_steps
+        
+        if self.use_cosine_schedule:
+            # Cosine annealing from initial_tau to final_tau
+            annealing_factor = 0.5 * (1 + math.cos(math.pi * progress))
+            new_tau = self.final_tau + (self.initial_tau - self.final_tau) * annealing_factor
+        else:
+            # Linear annealing from initial_tau to final_tau
+            new_tau = self.initial_tau - (self.initial_tau - self.final_tau) * progress
+
+        for module in self._moe_modules:
+            module.gumbel_tau = new_tau
+
+
+class SharedDropoutAnnealingCallback(TrainerCallback):
+    """
+    A callback to anneal the dropout probability for the shared expert in CombinedLayer.
+    """
+    def __init__(self, initial_prob=0.25, final_prob=0.0, use_cosine_schedule=True):
+        self.initial_prob = initial_prob
+        self.final_prob = final_prob
+        self.use_cosine_schedule = use_cosine_schedule
+        self._combined_layers = []
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if model is None:
+            return
+        
+        for module in model.modules():
+            if isinstance(module, CombinedLayer):
+                self._combined_layers.append(module)
+        
+        if self._combined_layers:
+            rank0_print(f"Shared expert dropout will be annealed from {self.initial_prob} to {self.final_prob}.")
+        else:
+            rank0_print("SharedDropoutAnnealingCallback: No CombinedLayer modules found.")
+
+    def on_step_begin(self, args, state, control, model=None, **kwargs):
+        if not self._combined_layers or state.max_steps <= 0:
+            return
+
+        progress = state.global_step / state.max_steps
+        
+        if self.use_cosine_schedule:
+            annealing_factor = 0.5 * (1 + math.cos(math.pi * progress))
+            new_prob = self.final_prob + (self.initial_prob - self.final_prob) * annealing_factor
+        else:
+            new_prob = self.initial_prob - (self.initial_prob - self.final_prob) * progress
+
+        for layer in self._combined_layers:
+            layer.shared_dropout.p = new_prob
+
+
+class AnnealingCallback(TrainerCallback):
+    """
+    A callback to dynamically anneal the structural loss weights for AdaptiveGroupingMoE layers
+    using a cosine annealing schedule.
+    """
+    def __init__(self, final_sparsity_weight=0.0, final_balance_weight=0.0, final_ortho_weight=0.0, final_separation_loss_weight=None):
+        self.final_sparsity_weight = final_sparsity_weight
+        self.final_balance_weight = final_balance_weight
+        self.final_ortho_weight = final_ortho_weight
+        self.final_separation_loss_weight = final_separation_loss_weight
+        self._initial_weights = {}
+        self._moe_modules = []
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if model is None:
+            return
+        
+        # Find all AdaptiveGroupingMoE modules and store their initial weights
+        for name, module in model.named_modules():
+            # Check for a unique attribute of AdaptiveGroupingMoE to identify it
+            if hasattr(module, "group_embeds") and hasattr(module, "expert_embeds"):
+                self._moe_modules.append(module)
+                # Store initial weights from the first module found (assuming they are all the same)
+                if not self._initial_weights:
+                    self._initial_weights['sparsity'] = module.sparsity_weight
+                    self._initial_weights['balance'] = module.balance_weight
+                    self._initial_weights['ortho'] = module.ortho_weight
+                    if self.final_separation_loss_weight is not None and hasattr(module, 'separation_loss_weight'):
+                        self._initial_weights['separation'] = module.separation_loss_weight
+        
+        if not self._moe_modules:
+            rank0_print("AnnealingCallback: No AdaptiveGroupingMoE modules found. This callback will do nothing.")
+
+    def on_step_begin(self, args, state, control, model=None, **kwargs):
+        if not self._moe_modules or state.max_steps <= 0:
+            return
+
+        # Calculate the annealing progress
+        progress = state.global_step / state.max_steps
+        # Cosine annealing schedule factor from 1 (start) to 0 (end)
+        annealing_factor = 0.5 * (1 + math.cos(math.pi * progress))
+
+        # Calculate new weights
+        new_sparsity_weight = self.final_sparsity_weight + (self._initial_weights['sparsity'] - self.final_sparsity_weight) * annealing_factor
+        new_balance_weight = self.final_balance_weight + (self._initial_weights['balance'] - self.final_balance_weight) * annealing_factor
+        new_ortho_weight = self.final_ortho_weight + (self._initial_weights['ortho'] - self.final_ortho_weight) * annealing_factor
+        if 'separation' in self._initial_weights:
+            new_separation_weight = self.final_separation_loss_weight + (self._initial_weights['separation'] - self.final_separation_loss_weight) * annealing_factor
+
+        # Update weights in all tracked modules
+        for module in self._moe_modules:
+            module.sparsity_weight = new_sparsity_weight
+            module.balance_weight = new_balance_weight
+            module.ortho_weight = new_ortho_weight
+            if 'separation' in self._initial_weights:
+                module.separation_loss_weight = new_separation_weight
+
+
+class PhasedAnnealingCallback(TrainerCallback):
+    """
+    A callback to dynamically anneal multiple loss weights with distinct schedules,
+    including a warmup phase where some weights can be kept at zero.
+    """
+    def __init__(self, 
+                 # Separation loss schedule
+                 final_separation_loss_weight=None,
+                 # Control parameters
+                 regularizer_warmup_proportion=0.2,
+                 initial_load_balance_weight=0.0,
+                 use_guidance_pulse_schedule=True,
+                 guidance_peak_proportion=0.5,
+                 guidance_end_proportion=1.0):
+        
+        self.final_separation_loss_weight = final_separation_loss_weight
+        self.regularizer_warmup_proportion = regularizer_warmup_proportion
+        self.initial_load_balance_weight = initial_load_balance_weight
+        self.use_guidance_pulse_schedule = use_guidance_pulse_schedule
+        self.guidance_peak_proportion = guidance_peak_proportion
+        self.guidance_end_proportion = guidance_end_proportion
+        
+        self._initial_weights = {}
+        self._moe_modules = []
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if model is None: return
+        
+        for name, module in model.named_modules():
+            if hasattr(module, "group_embeds") and hasattr(module, "expert_embeds"):
+                self._moe_modules.append(module)
+                if not self._initial_weights:
+                    # Store the initial weights set in the model config
+                    self._initial_weights['sparsity'] = module.sparsity_weight
+                    self._initial_weights['balance'] = module.balance_weight
+                    self._initial_weights['ortho'] = module.ortho_weight
+                    self._initial_weights['guidance'] = module.guidance_loss_weight # Add guidance
+                    self._initial_weights['load_balance'] = module.load_balance_weight # Add load_balance
+                    if self.final_separation_loss_weight is not None and hasattr(module, 'separation_loss_weight'):
+                        self._initial_weights['separation'] = module.separation_loss_weight
+        
+        if not self._moe_modules:
+            rank0_print("PhasedAnnealingCallback: No AdaptiveGroupingMoE modules found.")
+
+    def on_step_begin(self, args, state, control, model=None, **kwargs):
+        if not self._moe_modules or state.max_steps <= 0: return
+
+        progress = state.global_step / state.max_steps
+        
+        # --- Schedule 1: Main separation loss (full cosine decay from initial to final) ---
+        if 'separation' in self._initial_weights:
+            annealing_factor_sep = 0.5 * (1 + math.cos(math.pi * progress))
+            new_separation_weight = self.final_separation_loss_weight + \
+                                    (self._initial_weights['separation'] - self.final_separation_loss_weight) * annealing_factor_sep
+        
+        # --- Schedule 2 & 4: Regularizers and Load Balance (warmup then anneal) ---
+        if progress < self.regularizer_warmup_proportion:
+            # In warmup phase
+            new_sparsity_weight = 0.0
+            new_balance_weight = 0.0
+            new_ortho_weight = 0.0
+
+            # Warmup for load_balance_weight
+            warmup_progress = progress / self.regularizer_warmup_proportion
+            factor = 0.5 * (1 - math.cos(math.pi * warmup_progress))
+            new_load_balance_weight = self.initial_load_balance_weight + \
+                                      (self._initial_weights['load_balance'] - self.initial_load_balance_weight) * factor
+        else:
+            # After warmup phase
+            # Regularizers anneal from 0 to target
+            post_warmup_progress = (progress - self.regularizer_warmup_proportion) / (1.0 - self.regularizer_warmup_proportion)
+            annealing_factor_reg = 0.5 * (1 + math.cos(math.pi * post_warmup_progress))
+            reversed_factor = 1.0 - annealing_factor_reg
+            
+            new_sparsity_weight = self._initial_weights['sparsity'] * reversed_factor
+            new_balance_weight = self._initial_weights['balance'] * reversed_factor
+            new_ortho_weight = self._initial_weights['ortho'] * reversed_factor
+
+            # load_balance_weight stays at its target value
+            new_load_balance_weight = self._initial_weights['load_balance']
+
+        # --- Schedule 3: Guidance loss (potentially with a pulse schedule) ---
+        if self.use_guidance_pulse_schedule and 'guidance' in self._initial_weights:
+            warmup_end = self.regularizer_warmup_proportion
+            peak = self.guidance_peak_proportion
+            end = self.guidance_end_proportion
+
+            if progress < warmup_end or progress > end or peak <= warmup_end or end <= peak:
+                new_guidance_weight = 0.0
+            elif progress <= peak:
+                # Ramp-up phase from warmup_end to peak
+                ramp_up_progress = (progress - warmup_end) / (peak - warmup_end)
+                # Use a sine-like curve for smooth ramp-up from 0 to 1
+                factor = 0.5 * (1 - math.cos(math.pi * ramp_up_progress))
+                new_guidance_weight = self._initial_weights['guidance'] * factor
+            else: # peak < progress <= end
+                # Ramp-down phase from peak to end
+                ramp_down_progress = (progress - peak) / (end - peak)
+                # Use a cosine curve for smooth ramp-down from 1 to 0
+                factor = 0.5 * (1 + math.cos(math.pi * ramp_down_progress))
+                new_guidance_weight = self._initial_weights['guidance'] * factor
+        elif 'guidance' in self._initial_weights:
+            # Default behavior: use the same schedule as other regularizers
+            if progress < self.regularizer_warmup_proportion:
+                new_guidance_weight = 0.0
+            else:
+                post_warmup_progress = (progress - self.regularizer_warmup_proportion) / (1.0 - self.regularizer_warmup_proportion)
+                annealing_factor_reg = 0.5 * (1 + math.cos(math.pi * post_warmup_progress))
+                reversed_factor = 1.0 - annealing_factor_reg
+                new_guidance_weight = self._initial_weights['guidance'] * reversed_factor
+        else:
+            new_guidance_weight = 0.0
+
+        # Update weights in all tracked modules
+        for module in self._moe_modules:
+            if 'separation' in self._initial_weights:
+                module.separation_loss_weight = new_separation_weight
+            module.sparsity_weight = new_sparsity_weight
+            module.balance_weight = new_balance_weight
+            module.ortho_weight = new_ortho_weight
+            module.guidance_loss_weight = new_guidance_weight
+            module.load_balance_weight = new_load_balance_weight
 
 
 class MoEWandbCallback(WandbCallback):
@@ -89,8 +359,11 @@ class MoEWandbCallback(WandbCallback):
 
                 moe_metrics = {}
                 essential_metrics = [
-                    'l_load_balance', 'loss_sparsity', 'loss_balance', 'loss_ortho',
-                    'num_active_groups', 'group_size_std', 'group_size_max', 'group_size_entropy'
+                    'l_load_balance', 'loss_sparsity', 'loss_balance', 'loss_ortho', 'loss_separation', 'loss_intra', 'loss_inter',
+                    'weighted_l_load_balance', 'weighted_loss_sparsity', 'weighted_loss_balance', 'weighted_loss_ortho', 'weighted_loss_separation',
+                    'num_active_groups', 'group_size_std', 'group_size_max', 'group_size_entropy',
+                    'group_activation_entropy', 'expert_activation_entropy', 'empty_group_activation_rate', 'expert_utilization',
+                    'guidance_loss', 'weighted_guidance_loss',
                 ]
 
                 for name, module in model.named_modules():
@@ -112,15 +385,7 @@ class MoEWandbCallback(WandbCallback):
                             max_groups = module.max_groups
                             ratio_log_name = f"moe/layer_{layer_idx}/active_groups_ratio"
                             moe_metrics[ratio_log_name] = num_active / max_groups if max_groups > 0 else 0
-                        
-                        # Log weighted structural losses for direct impact analysis
-                        if 'loss_sparsity' in module.last_metrics:
-                            moe_metrics[f"moe/layer_{layer_idx}/weighted_loss_sparsity"] = module.last_metrics['loss_sparsity'] * module.sparsity_weight
-                        if 'loss_balance' in module.last_metrics:
-                            moe_metrics[f"moe/layer_{layer_idx}/weighted_loss_balance"] = module.last_metrics['loss_balance'] * module.balance_weight
-                        if 'loss_ortho' in module.last_metrics:
-                             moe_metrics[f"moe/layer_{layer_idx}/weighted_loss_ortho"] = module.last_metrics['loss_ortho'] * module.ortho_weight
-                        
+
                         del module.last_metrics
                 
                 if hasattr(model, "last_task_loss") and hasattr(model, "last_aux_loss"):
@@ -135,16 +400,49 @@ class MoEWandbCallback(WandbCallback):
                     del model.last_task_loss
                     del model.last_aux_loss
 
+                # Track the annealing of a representative weight
+                if all_moe_layers_indices:
+                    first_moe_module = None
+                    # Find the first MoE module to read the current weight from
+                    first_moe_layer_idx = all_moe_layers_indices[0]
+                    for name, module in model.named_modules():
+                        if isinstance(module, AdaptiveGroupingMoE):
+                            try:
+                                layer_idx = int(name.split('.')[2])
+                                if layer_idx == first_moe_layer_idx:
+                                    first_moe_module = module
+                                    break # Found it
+                            except (ValueError, IndexError):
+                                continue
+                    
+                    if first_moe_module:
+                        moe_metrics["annealing/sparsity_weight"] = first_moe_module.sparsity_weight
+                        moe_metrics["annealing/balance_weight"] = first_moe_module.balance_weight
+                        moe_metrics["annealing/ortho_weight"] = first_moe_module.ortho_weight
+                        if hasattr(first_moe_module, 'separation_loss_weight'):
+                            moe_metrics["annealing/separation_loss_weight"] = first_moe_module.separation_loss_weight
+                        if hasattr(first_moe_module, 'gumbel_tau'):
+                            moe_metrics["annealing/gumbel_tau"] = first_moe_module.gumbel_tau
+                        if hasattr(first_moe_module, 'guidance_loss_weight'):
+                            moe_metrics["annealing/guidance_loss_weight"] = first_moe_module.guidance_loss_weight
+                        if hasattr(first_moe_module, 'load_balance_weight'):
+                            moe_metrics["annealing/load_balance_weight"] = first_moe_module.load_balance_weight
+
+                    # Find the first CombinedLayer to log dropout probability
+                    first_combined_layer = None
+                    for module in model.modules():
+                        if isinstance(module, CombinedLayer):
+                            first_combined_layer = module
+                            break
+                    
+                    if first_combined_layer:
+                        moe_metrics["annealing/shared_dropout_prob"] = first_combined_layer.shared_dropout.p
+
                 if moe_metrics:
                     logs.update(moe_metrics)
 
-        # Let the parent class handle the actual logging to wandb
+        # Let the parent class handle the actual logging to wandb with the enriched dict
         super().on_log(args, state, control, logs=logs, model=model, **kwargs)
-
-
-def rank0_print(*args):
-    if local_rank == 0:
-        print(*args)
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -216,6 +514,19 @@ def find_all_linear_names(model, add_keywords=None):
     if 'lm_head' in lora_module_names: # needed for 16-bit
         lora_module_names.remove('lm_head')
     return list(lora_module_names)
+
+
+# def find_all_linear_names(model, add_keywords=None):
+#     lora_module_names = set()
+#     for name, module in model.named_modules():
+#         if not isinstance(module, torch.nn.Linear):
+#             # rank0_print(f'>>>> {name}: {type(module)}')
+#             continue
+#         if 'lm_head' in name:
+#             continue
+#         lora_module_names.add(name)
+
+#     return list(lora_module_names)
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
@@ -626,7 +937,7 @@ def preprocess_phi(
             if len(parts) != 2:
                 break
             parts[0] += sep
-            # print('after add sep, parts', parts)
+            # print('after add sep, parts')
 
             if has_image:
                 round_len = len(tokenizer_image_token(rou, tokenizer)) + 1  # for eos_token
@@ -1545,16 +1856,16 @@ def train():
                 new_state_dict[new_key] = value
             state_dict = new_state_dict
             # state_dict = {f'base_model.model.{k}': v for k, v in state_dict.items()}
-        if model_args.mone_expert_type == 'adaptive_grouping_expert':
-            # pop param, if 'wg' in k
-            for k in list(state_dict.keys()):
-                if 'wg' in k:
-                    state_dict.pop(k)
+        # if model_args.mone_expert_type == 'adaptive_grouping_expert':
+        #     # pop param, if 'wg' in k
+        #     for k in list(state_dict.keys()):
+        #         if 'wg' in k:
+        #             state_dict.pop(k)
         incompatible = model.load_state_dict(state_dict, strict=False)
         if bool([k for k in incompatible.missing_keys if 'lora' not in k]):
             rank0_print("Missing keys:", incompatible.missing_keys)
             rank0_print("Unexpected keys:", incompatible.unexpected_keys)
-            raise ValueError(f"Some keys are missing in the checkpoint {model_args.from_pretrained_path}, {incompatible.missing_keys}")
+            # raise ValueError(f"Some keys are missing in the checkpoint {model_args.from_pretrained_path}, {incompatible.missing_keys}")
         rank0_print(f'------------------------------- load from {model_args.from_pretrained_path} -------------------------------')
     # return
 
@@ -1774,20 +2085,72 @@ def train():
     # return
 
     if 'qwen2-vl' in model_args.model_name_or_path.lower():
+        custom_callbacks = [MoEWandbCallback()]
+        if model_args.use_annealing and hasattr(model_args, 'mone_expert_type') and model_args.mone_expert_type == 'adaptive_grouping_expert':
+            custom_callbacks.append(PhasedAnnealingCallback(
+                final_separation_loss_weight=model_args.final_separation_loss_weight,
+                regularizer_warmup_proportion=model_args.regularizer_warmup_proportion,
+                initial_load_balance_weight=model_args.initial_load_balance_weight,
+                use_guidance_pulse_schedule=model_args.use_guidance_pulse_schedule,
+                guidance_peak_proportion=model_args.guidance_peak_proportion,
+                guidance_end_proportion=model_args.guidance_end_proportion,
+            ))
+            rank0_print("PhasedAnnealingCallback has been added to the trainer.")
+        if model_args.use_gumbel_tau_annealing and hasattr(model_args, 'mone_expert_type') and model_args.mone_expert_type == 'adaptive_grouping_expert':
+            custom_callbacks.append(GumbelTauAnnealingCallback(
+                initial_tau=model_args.initial_gumbel_tau,
+                final_tau=model_args.final_gumbel_tau
+            ))
+            rank0_print("GumbelTauAnnealingCallback has been added to the trainer.")
+        
+        if model_args.use_shared_dropout_annealing:
+            custom_callbacks.append(SharedDropoutAnnealingCallback(
+                initial_prob=model_args.initial_shared_dropout_prob,
+                final_prob=model_args.final_shared_dropout_prob
+            ))
+            rank0_print("SharedDropoutAnnealingCallback has been added to the trainer.")
+        
+        # trainer = DebuggingTrainer(
         trainer = QwenMoETrainer(
             processing_class=processor,
             model=model,
             args=training_args,
-            callbacks=[MoEWandbCallback()],
+            callbacks=custom_callbacks,
             **data_module)
         if training_args.freeze_shared:
             trainer.add_callback(
                 EpochBasedUnfreezeCallback(unfreeze_shared_epoch=model_args.unfreeze_shared_epoch)
             )
     else:
+        custom_callbacks = [MoEWandbCallback()]
+        if model_args.use_annealing and hasattr(model_args, 'mone_expert_type') and model_args.mone_expert_type == 'adaptive_grouping_expert':
+            custom_callbacks.append(PhasedAnnealingCallback(
+                final_separation_loss_weight=model_args.final_separation_loss_weight,
+                regularizer_warmup_proportion=model_args.regularizer_warmup_proportion,
+                initial_load_balance_weight=model_args.initial_load_balance_weight,
+                use_guidance_pulse_schedule=model_args.use_guidance_pulse_schedule,
+                guidance_peak_proportion=model_args.guidance_peak_proportion,
+                guidance_end_proportion=model_args.guidance_end_proportion,
+            ))
+            rank0_print("PhasedAnnealingCallback has been added to the trainer.")
+        if model_args.use_gumbel_tau_annealing and hasattr(model_args, 'mone_expert_type') and model_args.mone_expert_type == 'adaptive_grouping_expert':
+            custom_callbacks.append(GumbelTauAnnealingCallback(
+                initial_tau=model_args.initial_gumbel_tau,
+                final_tau=model_args.final_gumbel_tau
+            ))
+            rank0_print("GumbelTauAnnealingCallback has been added to the trainer.")
+
+        if model_args.use_shared_dropout_annealing:
+            custom_callbacks.append(SharedDropoutAnnealingCallback(
+                initial_prob=model_args.initial_shared_dropout_prob,
+                final_prob=model_args.final_shared_dropout_prob
+            ))
+            rank0_print("SharedDropoutAnnealingCallback has been added to the trainer.")
+
         trainer = LLaVATrainer(model=model,
                         tokenizer=tokenizer,
                         args=training_args,
+                        callbacks=custom_callbacks,
                         **data_module)
 
     # Statistics of time and memory usage. Part 1

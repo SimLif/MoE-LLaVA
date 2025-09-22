@@ -1,10 +1,14 @@
 #!/bin/bash
 
 moe_mode="sparse"
-num_experts=6
+run_name="ww"
+num_experts=4
 top_k_experts=2
+# top_k_experts=$((${num_experts}/3))
 gpu_id=0
-epochs=5
+expert_type="small_expert"
+batch_size=4
+epochs=20
 use_residual=False
 router_aux_loss_coef=0.01
 JSON_FOLDER="/mnt/data/haoqiang/workspace/data/medmoe-vqa/3vqa"
@@ -30,14 +34,14 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
     --load_k_experts False \
     --k_experts_path /mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-12e4-ada-nano-ds-tok-share-1epoch \
     --from_pretrained False \
-    --from_pretrained_path /mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-96e32-mmed-nano-ds-tok-share-1epoch/pytorch_model.bin \
+    --from_pretrained_path /mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-12e4-ada-nano-s-tok-share-1epoch/pytorch_model.bin \
     --warm_up_experts False \
-    --use_shared_experts True \
+    --use_shared_experts False \
     --use_combined_gate False \
     --combined_gate_type cmr \
     --freeze_shared False \
     --unfreeze_shared_epoch 1 \
-    --mone_enable True \
+    --mone_enable False \
     --mone_expert_type ${expert_type} \
     --mone_gate_type "token_gating" \
     --mone_r $((8960/${top_k_experts})) \
@@ -54,7 +58,7 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
     --image_aspect_ratio pad \
     --group_by_modality_length True \
     --bf16 True \
-    --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-nano-s-tok-share-${epochs}epoch \
+    --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-${epochs}epoch-test1 \
     --num_train_epochs ${epochs} \
     --per_device_train_batch_size ${batch_size} \
     --per_device_eval_batch_size 4 \
@@ -73,7 +77,7 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
     --gradient_checkpointing True \
     --dataloader_num_workers 8 \
     --lazy_preprocess True \
-    --report_to wandb \
+    --report_to none \
     --run_name ${run_name} \
     --cache_dir "./cache_dir"
 
@@ -91,3 +95,4 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
 #                 ${JSON_FOLDER}/zh-huatuo-knowledge-graph-qa-30k.json \
 # --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-med-ada-5epoch-test \
 # --max_steps 1000 
+    # --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-${epochs}epoch \

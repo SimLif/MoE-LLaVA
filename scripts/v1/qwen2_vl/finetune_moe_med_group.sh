@@ -1,14 +1,14 @@
 #!/bin/bash
 
 moe_mode="sparse"
-run_name="ww"
-num_experts=4
+run_name="adaptive_grouping"
+num_experts=96
 top_k_experts=2
 # top_k_experts=$((${num_experts}/3))
 gpu_id=0
-expert_type="small_expert"
+expert_type="adaptive_grouping_expert"
 batch_size=4
-epochs=20
+epochs=5
 use_residual=False
 router_aux_loss_coef=0.01
 JSON_FOLDER="/mnt/data/haoqiang/workspace/data/medmoe-vqa/3vqa"
@@ -33,21 +33,42 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
     --skip_moe_init False \
     --load_k_experts False \
     --k_experts_path /mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-12e4-ada-nano-ds-tok-share-1epoch \
-    --from_pretrained False \
-    --from_pretrained_path /mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-12e4-ada-nano-s-tok-share-1epoch/pytorch_model.bin \
+    --from_pretrained True \
+    --from_pretrained_path /mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-96e32-ada-1epoch/pytorch_model.bin \
     --warm_up_experts False \
-    --use_shared_experts False \
+    --use_shared_experts True \
     --use_combined_gate False \
     --combined_gate_type cmr \
     --freeze_shared False \
     --unfreeze_shared_epoch 1 \
-    --mone_enable False \
+    --mone_enable True \
     --mone_expert_type ${expert_type} \
     --mone_gate_type "token_gating" \
-    --mone_r $((8960/${top_k_experts})) \
+    --mone_r $((8960/(${num_experts}/3))) \
     --mone_num_heads 1 \
     --mone_use_expert_gate True \
     --mone_load_original True \
+    --mone_max_groups $((${num_experts})) \
+    --mone_sparsity_weight 0.0 \
+    --mone_ortho_weight 0.0 \
+    --mone_balance_weight 0.0 \
+    --mone_load_balance_weight 1.0 \
+    --use_annealing True \
+    --use_separation_loss True \
+    --separation_loss_weight 1.0 \
+    --final_separation_loss_weight 0.001 \
+    --separation_loss_lambda 1.0 \
+    --use_gumbel_tau_annealing False \
+    --initial_gumbel_tau 2.0 \
+    --final_gumbel_tau 0.5 \
+    --shared_lr 2e-5 \
+    --use_shared_dropout_annealing False \
+    --initial_shared_dropout_prob 0.0 \
+    --final_shared_dropout_prob 0.0 \
+    --guidance_loss_weight 0.0 \
+    --use_guidance_pulse_schedule False \
+    --guidance_peak_proportion 0.3 \
+    --guidance_end_proportion 0.8 \
     --version med-moe \
     --data_path ${JSON_FOLDER}/train_all_converted.json \
     --image_folder ${IMAGE_FOLDER} \
@@ -58,7 +79,7 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
     --image_aspect_ratio pad \
     --group_by_modality_length True \
     --bf16 True \
-    --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-${epochs}epoch-test1 \
+    --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-${epochs}epoch-ada-agroup-detach-sep-load-aneal \
     --num_train_epochs ${epochs} \
     --per_device_train_batch_size ${batch_size} \
     --per_device_eval_batch_size 4 \
@@ -77,7 +98,7 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
     --gradient_checkpointing True \
     --dataloader_num_workers 8 \
     --lazy_preprocess True \
-    --report_to none \
+    --report_to wandb \
     --run_name ${run_name} \
     --cache_dir "./cache_dir"
 

@@ -333,6 +333,12 @@ class QwenMoETrainer(Trainer):
 
         opt_model = self.model
 
+        # print trainable parameters
+        print("Trainable parameters:")
+        for n, p in opt_model.named_parameters():
+            if p.requires_grad:
+                print(n)
+
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in self.model.parameters())
         print(f"可训练参数数量: {trainable_params/1e9:.2f} / {total_params/1e9:.2f} ({trainable_params/total_params:.2%})")
@@ -939,3 +945,53 @@ class QwenMoETrainer(Trainer):
             self._deactivate_neftune(self.model)
 
         return TrainOutput(self.state.global_step, train_loss, metrics)
+
+
+class DebuggingTrainer(QwenMoETrainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.grad_norms = {}
+        self.hooks_registered = False
+
+    def _register_hooks(self, model):
+        print("--- Registering gradient hooks for MoE and Shared parameters ---")
+        for name, param in model.named_parameters():
+            if ("moe" in name or "shared" in name) and param.requires_grad:
+                # The hook function will be called when the gradient for this parameter is computed
+                def create_hook_fn(param_name):
+                    def hook_fn(grad):
+                        if grad is not None:
+                            self.grad_norms[param_name] = torch.linalg.norm(grad.detach().float()).item()
+                        else:
+                            self.grad_norms[param_name] = "None"
+                    return hook_fn
+                
+                param.register_hook(create_hook_fn(name))
+                print(f"  Hook registered for: {name}")
+        self.hooks_registered = True
+
+    def training_step(self, model: torch.nn.Module, inputs: Dict[str, torch.Tensor], num_items_in_batch) -> torch.Tensor:
+        # Register hooks on the first training step
+        if not self.hooks_registered:
+            self._register_hooks(model)
+
+        # Clear previous step's gradients before the new backward pass
+        self.grad_norms.clear()
+
+        # Call the original training_step to perform forward, loss calculation, and backward
+        loss = super().training_step(model, inputs, num_items_in_batch)
+
+        # Gradient inspection block
+        # The hooks will have populated self.grad_norms during the backward pass
+        if self.state.is_world_process_zero and self.state.global_step > 0 and self.state.global_step % self.args.logging_steps == 0:
+            print(f"--- Gradient inspection at step {self.state.global_step} (from hooks) ---")
+            if self.grad_norms:
+                # Sort the items for consistent order
+                sorted_grads = sorted(self.grad_norms.items())
+                for name, norm in sorted_grads:
+                    print(f"  Param: {name}, Grad Norm: {norm}")
+            else:
+                print("  No gradients were captured by hooks. The backward pass might not have run or no hooked parameters received grads.")
+            print(f"--- End gradient inspection ---")
+        
+        return loss
