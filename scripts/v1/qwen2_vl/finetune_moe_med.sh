@@ -1,14 +1,14 @@
 #!/bin/bash
 
 moe_mode="sparse"
-run_name="ww"
-num_experts=4
-top_k_experts=2
+run_name="test-no-load"
+num_experts=12
+top_k_experts=4
 # top_k_experts=$((${num_experts}/3))
-gpu_id=0
-expert_type="small_expert"
+gpu_id=2
+expert_type="dense_mask_expert"
 batch_size=4
-epochs=20
+epochs=5
 use_residual=False
 router_aux_loss_coef=0.01
 JSON_FOLDER="/mnt/data/haoqiang/workspace/data/medmoe-vqa/3vqa"
@@ -36,18 +36,18 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
     --from_pretrained False \
     --from_pretrained_path /mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-12e4-ada-nano-s-tok-share-1epoch/pytorch_model.bin \
     --warm_up_experts False \
-    --use_shared_experts False \
+    --use_shared_experts True \
     --use_combined_gate False \
     --combined_gate_type cmr \
     --freeze_shared False \
     --unfreeze_shared_epoch 1 \
-    --mone_enable False \
+    --mone_enable True \
     --mone_expert_type ${expert_type} \
     --mone_gate_type "token_gating" \
     --mone_r $((8960/${top_k_experts})) \
     --mone_num_heads 1 \
     --mone_use_expert_gate True \
-    --mone_load_original True \
+    --mone_load_original False \
     --version med-moe \
     --data_path ${JSON_FOLDER}/train_all_converted.json \
     --image_folder ${IMAGE_FOLDER} \
@@ -58,7 +58,7 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
     --image_aspect_ratio pad \
     --group_by_modality_length True \
     --bf16 True \
-    --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-${epochs}epoch-test1 \
+    --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-${epochs}epoch-ds-no-load-org \
     --num_train_epochs ${epochs} \
     --per_device_train_batch_size ${batch_size} \
     --per_device_eval_batch_size 4 \
@@ -77,7 +77,7 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
     --gradient_checkpointing True \
     --dataloader_num_workers 8 \
     --lazy_preprocess True \
-    --report_to none \
+    --report_to wandb \
     --run_name ${run_name} \
     --cache_dir "./cache_dir"
 

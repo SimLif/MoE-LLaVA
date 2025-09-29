@@ -6,18 +6,20 @@ num_experts=4
 top_k_experts=2
 # top_k_experts=$((${num_experts}/3))
 gpu_id=0
-expert_type="small_expert"
+expert_type="dense_mask_expert"
 batch_size=4
-epochs=1
+epochs=5
 use_residual=False
-router_aux_loss_coef=0.00
+router_aux_loss_coef=0.01
+# JSON_FOLDER="/mnt/data/haoqiang/workspace/data/medvqa-r1-pmc-vqa-sft/r1_v1"
 JSON_FOLDER="/mnt/data/haoqiang/workspace/data/medmoe-vqa/3vqa"
 # JSON_FOLDER="/mnt/data/haoqiang/workspace/data/mmed"
 # JSON_FOLDER="/mnt/data/haoqiang/workspace/data/biomed-visual-instructions"
+# IMAGE_FOLDER="/mnt/data/haoqiang/workspace/data/medvqa-r1-pmc-vqa-sft/r1_v1"
 IMAGE_FOLDER="/mnt/data/haoqiang/workspace/data/medmoe-vqa/images"
 # IMAGE_FOLDER="/mnt/data/haoqiang/workspace/data/pubmedvision/images"
 cd ~/workspace/05-moe-llava
-export WANDB_PROJECT=moe-qwen2vl-med
+export WANDB_PROJECT=moe-qwen2vl-med-r1
 export NCCL_P2P_DISABLE=1
 export HF_DATASETS_OFFLINE=1 
 export TRANSFORMERS_OFFLINE=1
@@ -33,8 +35,10 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
     --skip_moe_init False \
     --load_k_experts False \
     --k_experts_path /mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-12e4-ada-nano-ds-tok-share-1epoch \
-    --from_pretrained False \
-    --from_pretrained_path /mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-12e4-ada-nano-s-tok-share-1epoch/pytorch_model.bin \
+    --from_pretrained True \
+    --from_pretrained_path /mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-4e2-med-ada-5epoch/pytorch_model.bin \
+    --lora_enable True \
+    --only_lora_ffn True \
     --warm_up_experts False \
     --use_shared_experts False \
     --use_combined_gate False \
@@ -49,7 +53,7 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
     --mone_use_expert_gate True \
     --mone_load_original True \
     --version med-moe \
-    --data_path ${JSON_FOLDER}/train_all_converted.json \
+    --data_path ${JSON_FOLDER}/r1_v1.json \
     --image_folder ${IMAGE_FOLDER} \
     --image_tower /mnt/data/haoqiang/workspace/models/qwen2-vl-2b-instruct \
     --mm_vision_select_layer -2 \
@@ -58,11 +62,11 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
     --image_aspect_ratio pad \
     --group_by_modality_length True \
     --bf16 True \
-    --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-${epochs}epoch \
+    --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-ft-r1-3vqa-${epochs}epoch-v1-lora \
     --num_train_epochs ${epochs} \
     --per_device_train_batch_size ${batch_size} \
     --per_device_eval_batch_size 4 \
-    --gradient_accumulation_steps $((16/${batch_size})) \
+    --gradient_accumulation_steps $((4/${batch_size})) \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
     --save_steps 500 \

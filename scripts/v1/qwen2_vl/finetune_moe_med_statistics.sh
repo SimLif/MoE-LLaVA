@@ -1,9 +1,30 @@
 #!/bin/bash
+if [ "$#" -lt 3 ]; then
+    echo "Usage: $0 <num_experts> <mone_expert_type> <per_device_train_batch_size>"
+    exit 1
+fi
+
+mone_expert_type_input=$2
+expert_type=""
+
+# 根据输入的 moe_expert_type_input 设置 expert_type
+if [ "$mone_expert_type_input" == "small_expert" ]; then
+    expert_type='s'
+elif [ "$mone_expert_type_input" == "dense_mask_expert" ]; then
+    expert_type='ds'
+else
+    # 如果输入了未知的 expert 类型，可以选择报错退出或设置一个默认值
+    echo "Error: Unknown moe_expert_type_input '$mone_expert_type_input'. Supported values are 'small_expert' or 'dense_mask_expert'."
+    # exit 1 # 如果需要，可以取消注释这一行以在未知类型时退出
+    # 或者，设置一个默认的 expert_type
+    # expert_type='default' # 例如
+fi
+
 
 moe_mode="sparse"
-num_experts=192
-top_k_experts=64
-gpu_id=2
+num_experts=$1
+top_k_experts=$((${num_experts}/3))
+gpu_id=4
 epochs=5
 use_residual=False
 router_aux_loss_coef=0.01
@@ -38,7 +59,7 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
     --freeze_shared False \
     --unfreeze_shared_epoch 1 \
     --mone_enable True \
-    --mone_expert_type "small_expert" \
+    --mone_expert_type $2 \
     --mone_gate_type "token_gating" \
     --mone_r $((8960/${top_k_experts})) \
     --mone_num_heads 1 \
@@ -54,11 +75,11 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
     --image_aspect_ratio pad \
     --group_by_modality_length True \
     --bf16 True \
-    --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-nano-s-tok-share-${epochs}epoch \
+    --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-${expert_type}-test \
     --num_train_epochs ${epochs} \
-    --per_device_train_batch_size 2 \
+    --per_device_train_batch_size $3 \
     --per_device_eval_batch_size 4 \
-    --gradient_accumulation_steps 8 \
+    --gradient_accumulation_steps $((16/${3})) \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
     --save_steps 500 \
@@ -73,9 +94,10 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
     --gradient_checkpointing True \
     --dataloader_num_workers 8 \
     --lazy_preprocess True \
-    --report_to wandb \
-    --run_name "s-tok-share" \
-    --cache_dir "./cache_dir"
+    --report_to none \
+    --cache_dir "./cache_dir" \
+    --max_steps 300 \
+    --enable_stat True
 
 
 # --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-ada-nano-test\
@@ -91,3 +113,4 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
 #                 ${JSON_FOLDER}/zh-huatuo-knowledge-graph-qa-30k.json \
 # --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-med-ada-5epoch-test \
 # --max_steps 1000 
+# --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-nano-s-tok-share-${epochs}epoch \

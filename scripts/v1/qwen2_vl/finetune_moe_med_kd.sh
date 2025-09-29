@@ -1,21 +1,21 @@
 #!/bin/bash
 
 moe_mode="sparse"
-num_experts=12
+num_experts=4
 top_k_experts=4
 use_residual=False
-router_aux_loss_coef=0.01
+router_aux_loss_coef=1
 # JSON_FOLDER="/mnt/data/haoqiang/workspace/data/medmoe-vqa/3vqa"
 JSON_FOLDER="/mnt/data/haoqiang/workspace/data/biomed-visual-instructions"
 # IMAGE_FOLDER="/mnt/data/haoqiang/workspace/data/medmoe-vqa/images"
 IMAGE_FOLDER="/mnt/data/haoqiang/workspace/data/pubmedvision/images"
 cd ~/workspace/05-moe-llava
-export WANDB_PROJECT=moe-qwen2vl-med
+export WANDB_PROJECT=moe-qwen2vl-med-k
 export NCCL_P2P_DISABLE=1
 export HF_DATASETS_OFFLINE=1 
 export TRANSFORMERS_OFFLINE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-deepspeed --include=localhost:2,3 --master_port=29502 moellava/train/train_mem.py \
+deepspeed --include=localhost:4,5 --master_port=29504 moellava/train/train_mem.py \
     --moe_enable True --num_experts ${num_experts} --top_k_experts ${top_k_experts} --capacity_factor 1.5 \
     --moe_mode ${moe_mode} --use_residual ${use_residual} --router_aux_loss_coef ${router_aux_loss_coef} \
     --train_modules mlp.gate_proj mlp.up_proj mlp.down_proj wg \
@@ -34,6 +34,7 @@ deepspeed --include=localhost:2,3 --master_port=29502 moellava/train/train_mem.p
     --combined_gate_type cmr \
     --freeze_shared False \
     --unfreeze_shared_epoch 1 \
+    --kd_align True \
     --mone_enable True \
     --mone_expert_type "dense_mask_expert" \
     --mone_gate_type "token_gating" \
@@ -51,14 +52,14 @@ deepspeed --include=localhost:2,3 --master_port=29502 moellava/train/train_mem.p
     --image_aspect_ratio pad \
     --group_by_modality_length True \
     --bf16 True \
-    --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-ada-nano-ds-tok-share-1epoch \
+    --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-ada-nano-ds-tok-kd-avg-1epoch \
     --num_train_epochs 1 \
     --per_device_train_batch_size 4 \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps 4 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 200 \
+    --save_steps 1000 \
     --save_total_limit 1 \
     --learning_rate 2e-5 \
     --weight_decay 0. \
@@ -70,8 +71,8 @@ deepspeed --include=localhost:2,3 --master_port=29502 moellava/train/train_mem.p
     --gradient_checkpointing True \
     --dataloader_num_workers 8 \
     --lazy_preprocess True \
-    --report_to wandb \
-    --run_name "share-ada" \
+    --report_to none \
+    --run_name "kd-align" \
     --cache_dir "./cache_dir"
 
 

@@ -5,7 +5,7 @@ run_name="adaptive_grouping"
 num_experts=96
 top_k_experts=2
 # top_k_experts=$((${num_experts}/3))
-gpu_id=0
+gpu_id=2
 expert_type="adaptive_grouping_expert"
 batch_size=4
 epochs=5
@@ -79,7 +79,7 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
     --image_aspect_ratio pad \
     --group_by_modality_length True \
     --bf16 True \
-    --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-${epochs}epoch-ada-agroup-detach-sep-load-aneal \
+    --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-${epochs}epoch-ada-agroup-detach-sep-8-1 \
     --num_train_epochs ${epochs} \
     --per_device_train_batch_size ${batch_size} \
     --per_device_eval_batch_size 4 \

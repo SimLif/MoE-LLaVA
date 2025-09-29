@@ -2,10 +2,9 @@
 
 moe_mode="sparse"
 run_name="small-shared"
-num_experts=7
-top_k_experts=3
-# top_k_experts=$((${num_experts}/3))
-gpu_id=0
+num_experts=15
+top_k_experts=$(((${num_experts}+1)/2-1))
+gpu_id=2
 expert_type="dense_mask_expert"
 shared_expert_type="small"
 batch_size=4
@@ -46,7 +45,7 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
     --mone_enable True \
     --mone_expert_type ${expert_type} \
     --mone_gate_type "token_gating" \
-    --mone_r $((8960/${top_k_experts})) \
+    --mone_r $((8960/((${num_experts}+1)/4))) \
     --mone_num_heads 1 \
     --mone_use_expert_gate True \
     --mone_load_original True \

@@ -1,10 +1,10 @@
 #!/bin/bash
 
 moe_mode="sparse"
-num_experts=4096
+num_experts=8
 top_k_experts=2
 use_residual=False
-router_aux_loss_coef=0.01
+router_aux_loss_coef=1
 # JSON_FOLDER="/mnt/data/haoqiang/workspace/data/medmoe-vqa/3vqa"
 # JSON_FOLDER="/mnt/data/haoqiang/workspace/data/biomed-visual-instructions"
 JSON_FOLDER="/mnt/data/haoqiang/workspace/data/med-k-nlp"
@@ -16,7 +16,7 @@ export NCCL_P2P_DISABLE=1
 export HF_DATASETS_OFFLINE=1 
 export TRANSFORMERS_OFFLINE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-deepspeed --include=localhost:2,3 --master_port=29500 moellava/train/train_mem.py \
+deepspeed --include=localhost:1,5 --master_port=29500 moellava/train/train_mem.py \
     --moe_enable True --num_experts ${num_experts} --top_k_experts ${top_k_experts} --capacity_factor 1.5 \
     --moe_mode ${moe_mode} --use_residual ${use_residual} --router_aux_loss_coef ${router_aux_loss_coef} \
     --train_modules mlp.gate_proj mlp.up_proj mlp.down_proj wg \
@@ -45,15 +45,15 @@ deepspeed --include=localhost:2,3 --master_port=29500 moellava/train/train_mem.p
     --image_aspect_ratio pad \
     --group_by_modality_length True \
     --bf16 True \
-    --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-med-k-ee-1363k\
+    --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-med-k-ns-ee-1363k\
     --num_train_epochs 1 \
     --per_device_train_batch_size 8 \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps 2 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 24000 \
-    --save_total_limit 1 \
+    --save_steps 20000 \
+    --save_total_limit 2 \
     --learning_rate 2e-5 \
     --weight_decay 0. \
     --warmup_ratio 0.03 \
