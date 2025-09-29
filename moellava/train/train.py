@@ -2085,7 +2085,10 @@ def train():
     # return
 
     if 'qwen2-vl' in model_args.model_name_or_path.lower():
-        custom_callbacks = [MoEWandbCallback()]
+        if model_args.mone_expert_type == 'adaptive_grouping_expert':
+            custom_callbacks = [MoEWandbCallback()]
+        else:
+            custom_callbacks = None
         if model_args.use_annealing and hasattr(model_args, 'mone_expert_type') and model_args.mone_expert_type == 'adaptive_grouping_expert':
             custom_callbacks.append(PhasedAnnealingCallback(
                 final_separation_loss_weight=model_args.final_separation_loss_weight,
