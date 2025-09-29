@@ -1856,11 +1856,11 @@ def train():
                 new_state_dict[new_key] = value
             state_dict = new_state_dict
             # state_dict = {f'base_model.model.{k}': v for k, v in state_dict.items()}
-        # if model_args.mone_expert_type == 'adaptive_grouping_expert':
-        #     # pop param, if 'wg' in k
-        #     for k in list(state_dict.keys()):
-        #         if 'wg' in k:
-        #             state_dict.pop(k)
+        if model_args.mone_expert_type == 'adaptive_grouping_expert':
+            # pop param, if 'wg' in k
+            for k in list(state_dict.keys()):
+                if 'wg' in k:
+                    state_dict.pop(k)
         incompatible = model.load_state_dict(state_dict, strict=False)
         if bool([k for k in incompatible.missing_keys if 'lora' not in k]):
             rank0_print("Missing keys:", incompatible.missing_keys)
