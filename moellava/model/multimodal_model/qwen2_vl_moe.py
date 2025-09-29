@@ -1786,8 +1786,22 @@ class AdaptiveGroupingMoE(nn.Module):
         l_load_balance, l_guidance, combine_weights, dispatch_mask, self.group_counts = self.gate(
             x, group_sizes=group_sizes.detach()
         )
+        # l_load_balance, l_guidance, combine_weights, dispatch_mask, self.group_counts = self.gate(
+        #     x, group_sizes=group_sizes
+        # )
         
         combine_dense_groups = combine_weights.to(x.dtype).sum(dim=-1)
+        
+        # --- Key Change: Implement residual connection for empty groups ---
+        # 1. For tokens routed to empty groups, calculate their contribution as a weighted residual connection.
+        # is_empty_mask = (group_sizes == 0).to(x.dtype)
+        # residual_weights = combine_dense_groups * is_empty_mask
+        # residual_scalar_weight = residual_weights.sum(dim=1, keepdim=True)
+        # residual_output = x * residual_scalar_weight
+
+        # 2. For tokens routed to active (non-empty) groups, compute their path through the MoE experts.
+        # The original calculation below is correct because the matmul with hard_assignment implicitly
+        # filters out empty groups, as their corresponding rows in hard_assignment are all zeros.
         combine_dense = torch.matmul(combine_dense_groups, hard_assignment)
 
         # 2. Fused 下投影：
@@ -1816,7 +1830,11 @@ class AdaptiveGroupingMoE(nn.Module):
         expert_up_weight = self.expert_up.weight.view(self.num_experts, self.expert_dim, self.hidden_size)
         # 计算公式：
         #   output[n, h] = sum_{e, b} combine_dense[n, e] * intermediate_all[n, e, b] * expert_up_weight[e, b, h]
+        # moe_output = torch.einsum('ne, neb, ebh -> nh', combine_dense, intermediate_all, expert_up_weight)
         output = torch.einsum('ne, neb, ebh -> nh', combine_dense, intermediate_all, expert_up_weight)
+
+        # Combine the MoE output with the residual output.
+        # output = moe_output + residual_output
 
         # self.co_occurrence = self.count_expert_cooccurrence(combine_dense)
         self.combine_dense = combine_dense
