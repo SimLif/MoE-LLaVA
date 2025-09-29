@@ -218,7 +218,7 @@ class PhasedAnnealingCallback(TrainerCallback):
         
         self.final_separation_loss_weight = final_separation_loss_weight
         self.regularizer_warmup_proportion = regularizer_warmup_proportion
-        self.initial_load_balance_weight = initial_load_balance_weight
+        # self.initial_load_balance_weight = initial_load_balance_weight
         self.use_guidance_pulse_schedule = use_guidance_pulse_schedule
         self.guidance_peak_proportion = guidance_peak_proportion
         self.guidance_end_proportion = guidance_end_proportion
@@ -264,10 +264,10 @@ class PhasedAnnealingCallback(TrainerCallback):
             new_ortho_weight = 0.0
 
             # Warmup for load_balance_weight
-            warmup_progress = progress / self.regularizer_warmup_proportion
-            factor = 0.5 * (1 - math.cos(math.pi * warmup_progress))
-            new_load_balance_weight = self.initial_load_balance_weight + \
-                                      (self._initial_weights['load_balance'] - self.initial_load_balance_weight) * factor
+            # warmup_progress = progress / self.regularizer_warmup_proportion
+            # factor = 0.5 * (1 - math.cos(math.pi * warmup_progress))
+            # new_load_balance_weight = self.initial_load_balance_weight + \
+            #                           (self._initial_weights['load_balance'] - self.initial_load_balance_weight) * factor
         else:
             # After warmup phase
             # Regularizers anneal from 0 to target
@@ -280,7 +280,7 @@ class PhasedAnnealingCallback(TrainerCallback):
             new_ortho_weight = self._initial_weights['ortho'] * reversed_factor
 
             # load_balance_weight stays at its target value
-            new_load_balance_weight = self._initial_weights['load_balance']
+            # new_load_balance_weight = self._initial_weights['load_balance']
 
         # --- Schedule 3: Guidance loss (potentially with a pulse schedule) ---
         if self.use_guidance_pulse_schedule and 'guidance' in self._initial_weights:
@@ -322,7 +322,7 @@ class PhasedAnnealingCallback(TrainerCallback):
             module.balance_weight = new_balance_weight
             module.ortho_weight = new_ortho_weight
             module.guidance_loss_weight = new_guidance_weight
-            module.load_balance_weight = new_load_balance_weight
+            # module.load_balance_weight = new_load_balance_weight
 
 
 class MoEWandbCallback(WandbCallback):
