@@ -1,40 +1,59 @@
 #!/bin/bash
+#SBATCH --account=c4gcot 
+#SBATCH --partition=preempt
+#SBATCH --ntasks=1
+#SBATCH --gpus-per-node=2
+#SBATCH --time=6:00:00
+#SBATCH --job-name=moe-llava
+#SBATCH --output=../logs/%x_%j.out
+#SBATCH --error=../logs/%x_%j.err
+
+# Load modules if needed (e.g., module load cuda)
+# Activate venv if needed (e.g., source activate my_env)
+module avail
+module load slurm "nvhpc-hpcx-cuda12/23.11"
 
 moe_mode="sparse"
-run_name="adaptive_grouping"
-num_experts=96
+
+num_experts=12
 top_k_experts=2
+num_groups=3
 # top_k_experts=$((${num_experts}/3))
-gpu_id=2
+run_name="fgmoe-ada-${num_experts}g${top_k_experts}-n${num_groups}"
+gpu_id=0
 expert_type="adaptive_grouping_expert"
 batch_size=4
 epochs=5
 use_residual=False
 router_aux_loss_coef=0.01
-JSON_FOLDER="/mnt/data/haoqiang/workspace/data/medmoe-vqa/3vqa"
+JSON_FOLDER="/project/c4gcot/datasets/medmoe-vqa/3vqa"
+# JSON_FOLDER="/project/c4gcot/datasets/mimic-cxr-dataset"
+# JSON_FOLDER="/project/c4gcot/datasets/food-vqa-benchmark/"
 # JSON_FOLDER="/mnt/data/haoqiang/workspace/data/mmed"
 # JSON_FOLDER="/mnt/data/haoqiang/workspace/data/biomed-visual-instructions"
-IMAGE_FOLDER="/mnt/data/haoqiang/workspace/data/medmoe-vqa/images"
+IMAGE_FOLDER="/project/c4gcot/datasets/medmoe-vqa/images"
+# IMAGE_FOLDER="/project/c4gcot/datasets/mimic-cxr-dataset/images"
+# IMAGE_FOLDER="/project/c4gcot/datasets/food-vqa-benchmark/images"
 # IMAGE_FOLDER="/mnt/data/haoqiang/workspace/data/pubmedvision/images"
 cd ~/workspace/05-moe-llava
 export WANDB_PROJECT=moe-qwen2vl-med
-export NCCL_P2P_DISABLE=1
+# export NCCL_P2P_DISABLE=1
 export HF_DATASETS_OFFLINE=1 
 export TRANSFORMERS_OFFLINE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_id}+29500)) moellava/train/train_mem.py \
+uv run deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_id}+29503)) moellava/train/train_mem.py \
     --moe_enable True --num_experts ${num_experts} --top_k_experts ${top_k_experts} --capacity_factor 1.5 \
     --moe_mode ${moe_mode} --use_residual ${use_residual} --router_aux_loss_coef ${router_aux_loss_coef} \
     --train_modules mlp.gate_proj mlp.up_proj mlp.down_proj wg \
     --deepspeed ./scripts/zero2.json \
-    --model_name_or_path /mnt/data/haoqiang/workspace/models/qwen2-vl-2b-instruct \
+    --model_name_or_path /project/c4gcot/models/Qwen2-VL-2B-Instruct \
     --image_min_pixels $((16 * 28 * 28)) \
     --image_max_pixels $((576 * 28 * 28)) \
     --skip_moe_init False \
     --load_k_experts False \
     --k_experts_path /mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-12e4-ada-nano-ds-tok-share-1epoch \
     --from_pretrained True \
-    --from_pretrained_path /mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-96e32-ada-1epoch/pytorch_model.bin \
+    --from_pretrained_path /project/c4gcot/models/FGMoE/qwen2-vl-2b-instruct-12e4-ada-nano-ds-tok-share-1epoch/pytorch_model.bin \
     --warm_up_experts False \
     --use_shared_experts True \
     --use_combined_gate False \
@@ -48,17 +67,17 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
     --mone_num_heads 1 \
     --mone_use_expert_gate True \
     --mone_load_original True \
-    --mone_max_groups $((${num_experts})) \
-    --mone_sparsity_weight 0.0 \
-    --mone_ortho_weight 0.0 \
-    --mone_balance_weight 0.0 \
-    --mone_load_balance_weight 1.0 \
+    --mone_max_groups $((${num_groups})) \
+    --mone_sparsity_weight 0.01 \
+    --mone_ortho_weight 0.1 \
+    --mone_balance_weight 0.01 \
+    --mone_load_balance_weight 0.01 \
     --use_annealing True \
     --use_separation_loss True \
     --separation_loss_weight 1.0 \
     --final_separation_loss_weight 0.001 \
     --separation_loss_lambda 1.0 \
-    --use_gumbel_tau_annealing False \
+    --use_gumbel_tau_annealing True \
     --initial_gumbel_tau 2.0 \
     --final_gumbel_tau 0.5 \
     --shared_lr 2e-5 \
@@ -72,14 +91,14 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
     --version med-moe \
     --data_path ${JSON_FOLDER}/train_all_converted.json \
     --image_folder ${IMAGE_FOLDER} \
-    --image_tower /mnt/data/haoqiang/workspace/models/qwen2-vl-2b-instruct \
+    --image_tower /project/c4gcot/models/Qwen2-VL-2B-Instruct \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
     --image_aspect_ratio pad \
     --group_by_modality_length True \
     --bf16 True \
-    --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-${epochs}epoch-ada-agroup-detach-sep-8-1 \
+    --output_dir /scratch/c4gcot/hqguo/checkpoints/${run_name} \
     --num_train_epochs ${epochs} \
     --per_device_train_batch_size ${batch_size} \
     --per_device_eval_batch_size 4 \
@@ -117,3 +136,4 @@ deepspeed --include=localhost:${gpu_id},$((${gpu_id}+1)) --master_port=$((${gpu_
 # --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-med-ada-5epoch-test \
 # --max_steps 1000 
     # --output_dir ./checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-${epochs}epoch \
+    #  --output_dir /scratch/c4gcot/hqguo/checkpoints/qwen2-vl-2b-instruct-${num_experts}e${top_k_experts}-${epochs}epoch-ada-agroup-t2 \
